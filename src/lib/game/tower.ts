@@ -519,6 +519,7 @@ export type Player = {
   attackTimer: number;
   skillCd: [number, number, number];
   hurtFlash: number;
+  animTime: number; // 걷기 애니메이션 누적 시간
 };
 
 export type Enemy = {
@@ -953,6 +954,7 @@ export class Game {
       attackTimer: 0,
       skillCd: [0, 0, 0],
       hurtFlash: 0,
+      animTime: 0,
     };
     this.floor = 1;
     this.roomIndex = 0;
@@ -1062,6 +1064,13 @@ export class Game {
       }
       const maxV = MOVE_MAX * this.stats.moveMul * (p.attackTimer > 0 && p.onGround ? 0.35 : 1);
       p.vx = Math.max(-maxV, Math.min(maxV, p.vx));
+    }
+
+    // 걷기 애니메이션: 지면에서 이동 중일 때 속도에 비례해 진행
+    if (p.onGround && Math.abs(p.vx) > 20) {
+      p.animTime += dt * (0.6 + Math.abs(p.vx) / MOVE_MAX);
+    } else {
+      p.animTime = 0; // 정지/공중이면 기본 포즈(프레임 0)
     }
 
     // jump
@@ -2043,11 +2052,39 @@ export class Game {
     const p = this.player;
     const pFlash = p.hurtFlash > 0 || p.iframes > 0.3;
     ctx.globalAlpha = p.iframes > 0 ? 0.6 : 1;
-    ctx.fillStyle = pFlash ? "#e94b3c" : "#f5f5f5";
-    ctx.fillRect(p.x - p.w / 2, p.y - p.h, p.w, p.h);
-    // face direction slit
-    ctx.fillStyle = "#141414";
-    ctx.fillRect(p.facing > 0 ? p.x + 2 : p.x - 10, p.y - p.h + 14, 8, 3);
+
+    const spriteName = CLASS_SPRITE[this.playerClass];
+    const set = spriteName ? loadSpriteSet(spriteName) : null;
+
+    if (set && set.loaded) {
+      // 걷기 4프레임 순환 (정지 시 0)
+      const frame = p.animTime > 0 ? Math.floor(p.animTime * 8) % 4 : 0;
+      const img = set.frames[frame];
+      // 히트박스 높이에 맞춰 스케일 (발바닥 = p.y 에 정렬)
+      const targetH = p.h * 1.9; // 스프라이트에 여백이 포함되어 살짝 크게
+      const scale = targetH / img.height;
+      const dw = img.width * scale;
+      const dh = img.height * scale;
+      const footY = p.y;
+      // 피격 시 점멸 (iframes 잔량으로 위상 생성)
+      const blink = pFlash && Math.floor(p.iframes * 30) % 2 === 0;
+      ctx.globalAlpha *= blink ? 0.35 : 1;
+      ctx.save();
+      if (p.facing < 0) {
+        ctx.translate(p.x, 0);
+        ctx.scale(-1, 1);
+        ctx.drawImage(img, -dw / 2, footY - dh, dw, dh);
+      } else {
+        ctx.drawImage(img, p.x - dw / 2, footY - dh, dw, dh);
+      }
+      ctx.restore();
+    } else {
+      // 폴백: 기존 사각형
+      ctx.fillStyle = pFlash ? "#e94b3c" : "#f5f5f5";
+      ctx.fillRect(p.x - p.w / 2, p.y - p.h, p.w, p.h);
+      ctx.fillStyle = "#141414";
+      ctx.fillRect(p.facing > 0 ? p.x + 2 : p.x - 10, p.y - p.h + 14, 8, 3);
+    }
     ctx.globalAlpha = 1;
     // sword indicator for attack
     if (p.attackTimer > 0) {
@@ -2080,6 +2117,44 @@ export class Game {
 function devicePixelRatioSafe() {
   if (typeof window === "undefined") return 1;
   return Math.min(2, window.devicePixelRatio || 1);
+}
+
+// ─── 캐릭터 스프라이트 ──────────────────────────────────────────────
+// 직업 → 스프라이트 세트 이름. 아직 전용 이미지가 없는 직업은 매핑에서 빼면
+// 렌더러가 기존 사각형으로 폴백한다.
+const CLASS_SPRITE: Partial<Record<ClassId, string>> = {
+  assassin: "assassin",
+  guardian: "guardian",
+  // 마법사 계열 직업이 없으므로 sorcerer는 추후 매핑. (예: mage 직업 추가 시)
+};
+
+type SpriteSet = { frames: HTMLImageElement[]; loaded: boolean };
+const spriteCache: Record<string, SpriteSet> = {};
+
+// 지정한 세트를 로드(최초 1회). 4프레임 걷기.
+function loadSpriteSet(name: string): SpriteSet {
+  if (spriteCache[name]) return spriteCache[name];
+  const set: SpriteSet = { frames: [], loaded: false };
+  spriteCache[name] = set;
+  if (typeof window === "undefined") return set;
+  let done = 0;
+  for (let i = 0; i < 4; i++) {
+    const img = new Image();
+    img.onload = () => {
+      done++;
+      if (done === 4) set.loaded = true;
+    };
+    img.src = `/sprites/${name}_${i}.png`;
+    set.frames.push(img);
+  }
+  return set;
+}
+
+// 미리 로드해두면 첫 등장 시 깜빡임이 없다.
+export function preloadSprites() {
+  for (const name of Object.values(CLASS_SPRITE)) {
+    if (name) loadSpriteSet(name);
+  }
 }
 
 // #rrggbb 색을 amt(-100~100)만큼 밝게/어둡게 조정
