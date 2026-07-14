@@ -524,7 +524,16 @@ export type Player = {
 
 export type Enemy = {
   id: number;
-  type: "grunt" | "archer" | "charger" | "mage" | "boss";
+  type:
+    | "grunt"
+    | "archer"
+    | "charger"
+    | "mage"
+    | "shielder"
+    | "bomber"
+    | "flyer"
+    | "brute"
+    | "boss";
   x: number;
   y: number;
   vx: number;
@@ -692,6 +701,22 @@ function makeEnemy(type: Enemy["type"], x: number, y: number): Enemy {
   if (type === "mage") {
     return { ...base, hp: 16, maxHp: 16, w: 30, h: 46, dmg: 7 };
   }
+  if (type === "shielder") {
+    // 방패병: 방패를 들고 압박하다 강타. 방패를 든 동안 받는 피해가 크게 줄어든다.
+    return { ...base, hp: 34, maxHp: 34, w: 34, h: 46, dmg: 11 };
+  }
+  if (type === "bomber") {
+    // 폭탄병: 접근해 자폭. 터지기 전에 처치하면 보상, 터지면 큰 광역 피해.
+    return { ...base, hp: 10, maxHp: 10, w: 26, h: 34, dmg: 26 };
+  }
+  if (type === "flyer") {
+    // 비행형: 공중을 부유하며 급강하 돌진.
+    return { ...base, hp: 16, maxHp: 16, w: 28, h: 26, dmg: 9 };
+  }
+  if (type === "brute") {
+    // 거인병: 느리지만 맷집과 화력이 강함. 강타 시 좌우로 충격파.
+    return { ...base, hp: 55, maxHp: 55, w: 44, h: 56, dmg: 18 };
+  }
   // boss
   return {
     ...base,
@@ -728,6 +753,18 @@ export const TOWER_ZONES: { from: number; theme: TowerTheme }[] = [
     },
   },
   {
+    from: 8,
+    theme: {
+      id: "catacomb",
+      name: "쇠사슬 통로",
+      bg: "#181410",
+      fog: "rgba(216,178,120,0.04)",
+      platform: "#211a14",
+      edge: "#d8b278",
+      enemyPool: ["grunt", "archer", "shielder"],
+    },
+  },
+  {
     from: 15,
     theme: {
       id: "poison",
@@ -736,7 +773,19 @@ export const TOWER_ZONES: { from: number; theme: TowerTheme }[] = [
       fog: "rgba(120,220,140,0.05)",
       platform: "#16241a",
       edge: "#8fe3a2",
-      enemyPool: ["grunt", "archer", "charger"],
+      enemyPool: ["grunt", "archer", "charger", "bomber"],
+    },
+  },
+  {
+    from: 22,
+    theme: {
+      id: "madness",
+      name: "광기의 회랑",
+      bg: "#170f1c",
+      fog: "rgba(200,120,220,0.05)",
+      platform: "#22162a",
+      edge: "#c97ee0",
+      enemyPool: ["charger", "bomber", "flyer"],
     },
   },
   {
@@ -748,7 +797,31 @@ export const TOWER_ZONES: { from: number; theme: TowerTheme }[] = [
       fog: "rgba(140,180,255,0.05)",
       platform: "#161f33",
       edge: "#8fb4ff",
-      enemyPool: ["charger", "archer", "mage"],
+      enemyPool: ["charger", "archer", "mage", "flyer"],
+    },
+  },
+  {
+    from: 35,
+    theme: {
+      id: "bloodaltar",
+      name: "피의 제단",
+      bg: "#1c0f10",
+      fog: "rgba(233,75,60,0.05)",
+      platform: "#2a1416",
+      edge: "#e9605a",
+      enemyPool: ["mage", "brute", "shielder"],
+    },
+  },
+  {
+    from: 44,
+    theme: {
+      id: "thinair",
+      name: "희박한 정상",
+      bg: "#10151c",
+      fog: "rgba(180,200,230,0.05)",
+      platform: "#19212c",
+      edge: "#b9c8e0",
+      enemyPool: ["brute", "flyer", "bomber", "mage"],
     },
   },
   {
@@ -760,7 +833,7 @@ export const TOWER_ZONES: { from: number; theme: TowerTheme }[] = [
       fog: "rgba(255,120,90,0.06)",
       platform: "#2a1512",
       edge: "#ff8f6b",
-      enemyPool: ["charger", "mage", "grunt"],
+      enemyPool: ["charger", "mage", "brute", "bomber"],
     },
   },
 ];
@@ -834,7 +907,8 @@ function generateRoom(
     for (let i = 0; i < count; i++) {
       const t = pickEnemyType(floor);
       const ex = 260 + Math.random() * (w - 500);
-      const ey = groundY - 60;
+      const ey =
+        t === "flyer" ? groundY - 60 - 140 - Math.random() * 80 : groundY - 60;
       const e = makeEnemy(t, ex, ey);
       e.hp = e.maxHp = Math.round(e.maxHp * (1 + (floor - 1) * 0.15));
       e.dmg = Math.round(e.dmg * (1 + (floor - 1) * 0.1));
@@ -1338,9 +1412,11 @@ export class Game {
     e.atkCd = Math.max(0, e.atkCd - dt);
     if (e.hurtFlash > 0) e.hurtFlash -= dt;
 
-    // gravity (haste 영향 제외 — 낙하는 일정하게)
-    e.vy += GRAVITY * dtRaw;
-    e.vy = Math.min(e.vy, MAX_FALL);
+    // gravity (haste 영향 제외 — 낙하는 일정하게). 비행형은 자체 부양 로직을 쓴다.
+    if (e.type !== "flyer") {
+      e.vy += GRAVITY * dtRaw;
+      e.vy = Math.min(e.vy, MAX_FALL);
+    }
 
     if (e.type === "grunt") {
       const dist = Math.abs(dx);
@@ -1464,6 +1540,166 @@ export class Game {
             fromEnemy: true,
             homing: 2.2,
           });
+        }
+      }
+    } else if (e.type === "shielder") {
+      // 방패병: 접근 → 방패를 들고 압박(피해 대폭 감소) → 방패 강타
+      const dist = Math.abs(dx);
+      if (e.state === 0) {
+        if (dist > 60) e.vx = e.facing * 80;
+        else e.vx *= 0.6;
+        if (dist < 130 && e.atkCd <= 0) {
+          e.state = 1;
+          e.stateTimer = 1.1; // 방패 든 채 압박
+        }
+      } else if (e.state === 1) {
+        if (dist > 50) e.vx = e.facing * 50;
+        else e.vx *= 0.6;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          e.state = 2;
+          e.stateTimer = 0.25; // 강타 예비 동작
+          e.vx = 0;
+        }
+      } else if (e.state === 2) {
+        e.vx *= 0.4;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          if (dist < 70 && Math.abs(p.y - e.y) < 60) {
+            spawnHitbox(this, {
+              x: e.x + (e.facing > 0 ? 0 : -56),
+              y: e.y - 42,
+              w: 56,
+              h: 44,
+              dmg: e.dmg,
+              life: 0.18,
+              fromEnemy: true,
+              knockback: 320,
+            });
+          }
+          e.state = 0;
+          e.atkCd = 0.9;
+        }
+      }
+    } else if (e.type === "bomber") {
+      // 폭탄병: 빠르게 접근해 자폭. 터지기 전에 처치하지 않으면 큰 광역 피해.
+      const dist = Math.abs(dx);
+      if (e.state === 0) {
+        if (dist > 30) e.vx = e.facing * 200;
+        else e.vx *= 0.5;
+        if (dist < 90) {
+          e.state = 1;
+          e.stateTimer = 0.8; // 점화 시간
+          e.vx = 0;
+        }
+      } else if (e.state === 1) {
+        e.vx *= 0.5;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          spawnHitbox(this, {
+            x: e.x - 70,
+            y: e.y - 60,
+            w: 140,
+            h: 70,
+            dmg: e.dmg,
+            life: 0.12,
+            fromEnemy: true,
+            knockback: 380,
+          });
+          this.shake = Math.max(this.shake, 10);
+          e.dead = true;
+          e.dying = 0.2;
+          e.hp = 0;
+        }
+      }
+    } else if (e.type === "flyer") {
+      // 비행형: 공중을 부유하며 급강하 돌진
+      const dist = Math.abs(dx);
+      if (e.state !== 2) {
+        const desiredY = this.groundY - 190 + Math.sin(e.ai * 1.6 + e.id) * 26;
+        e.vy = (desiredY - e.y) * 4;
+      }
+      if (e.state === 0) {
+        if (dist > 70) e.vx = e.facing * 150;
+        else e.vx *= 0.8;
+        if (e.atkCd <= 0 && dist < 260 && dist > 60) {
+          e.state = 1;
+          e.stateTimer = 0.35; // 급강하 예비(텔레그래프)
+          e.vx *= 0.3;
+        }
+      } else if (e.state === 1) {
+        e.vx *= 0.5;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          e.state = 2;
+          e.stateTimer = 0.6;
+          e.vx = e.facing * 60;
+        }
+      } else if (e.state === 2) {
+        e.vy = 520;
+        e.stateTimer -= dt;
+        if (dist < 36 && Math.abs(p.y - e.y) < 54) {
+          spawnHitbox(this, {
+            x: e.x - 20,
+            y: e.y - 28,
+            w: 40,
+            h: 30,
+            dmg: e.dmg,
+            life: 0.12,
+            fromEnemy: true,
+            knockback: 240,
+          });
+          e.state = 3;
+          e.stateTimer = 0.7;
+          e.atkCd = 2.4;
+        } else if (e.stateTimer <= 0 || e.onGround) {
+          e.state = 3;
+          e.stateTimer = 0.7;
+          e.atkCd = 2.4;
+        }
+      } else {
+        // 회복 비행: 다시 떠오른다
+        e.vx *= 0.7;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) e.state = 0;
+      }
+    } else if (e.type === "brute") {
+      // 거인병: 느린 접근 → 강타(전방 히트박스 + 좌우 충격파)
+      const dist = Math.abs(dx);
+      if (e.state === 0) {
+        if (dist > 70) e.vx = e.facing * 60;
+        else e.vx *= 0.5;
+        if (dist < 90 && e.atkCd <= 0) {
+          e.state = 1;
+          e.stateTimer = 0.6; // 강타 예비 동작
+          e.vx = 0;
+        }
+      } else if (e.state === 1) {
+        e.vx *= 0.4;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          e.state = 2;
+          e.stateTimer = 0.2;
+          spawnHitbox(this, {
+            x: e.x - 60,
+            y: e.y - 30,
+            w: 120,
+            h: 34,
+            dmg: e.dmg,
+            life: 0.16,
+            fromEnemy: true,
+            knockback: 340,
+          });
+          this.spawnHazard(e.x + 100, this.groundY, 50, e.dmg * 0.5, 0.25);
+          this.spawnHazard(e.x - 100, this.groundY, 50, e.dmg * 0.5, 0.25);
+          this.shake = Math.max(this.shake, 9);
+        }
+      } else {
+        e.vx *= 0.6;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          e.state = 0;
+          e.atkCd = 1.4;
         }
       }
     } else {
@@ -1707,6 +1943,8 @@ export class Game {
       d *= this.stats.critMul;
       crit = true;
     }
+    // 방패병: 방패를 든 상태(state 1)에서는 받는 피해가 크게 줄어든다
+    if (e.type === "shielder" && e.state === 1) d *= 0.35;
     e.hp -= d;
     e.hurtFlash = 0.12;
     e.vx += facing * kb;
@@ -1728,13 +1966,21 @@ export class Game {
       const reward =
         e.type === "boss"
           ? 30
-          : e.type === "charger"
-            ? 5
-            : e.type === "mage"
+          : e.type === "brute"
+            ? 6
+            : e.type === "charger"
               ? 5
-              : e.type === "archer"
-                ? 4
-                : 3;
+              : e.type === "mage"
+                ? 5
+                : e.type === "shielder"
+                  ? 5
+                  : e.type === "archer"
+                    ? 4
+                    : e.type === "flyer"
+                      ? 4
+                      : e.type === "bomber"
+                        ? 4
+                        : 3;
       this.earnedSouls += reward;
       this.runSouls += reward;
       if (this.stats.lifesteal > 0) {
@@ -2014,13 +2260,24 @@ export class Game {
             ? "#bfa9e6"
             : e.type === "archer"
               ? "#cfd6c0"
-              : e.type === "boss"
-                ? (e.bossKind ? BOSS_INFO[e.bossKind].color : "#f0f0f0")
-                : "#e9e9e9";
+              : e.type === "shielder"
+                ? "#7a8fa6"
+                : e.type === "bomber"
+                  ? "#e0a25c"
+                  : e.type === "flyer"
+                    ? "#5c6b8a"
+                    : e.type === "brute"
+                      ? "#8a5a4a"
+                      : e.type === "boss"
+                        ? (e.bossKind ? BOSS_INFO[e.bossKind].color : "#f0f0f0")
+                        : "#e9e9e9";
       const flashing = e.hurtFlash > 0;
-      // 돌격병 준비 상태(state 1)일 때 붉게 점멸 — 회피 텔레그래프
+      // 상태별 공격 예고 점멸 — 돌격병 돌진, 폭탄병 점화, 비행형 급강하
       const telegraph =
-        e.type === "charger" && e.state === 1 && Math.floor(e.ai * 20) % 2 === 0;
+        (e.type === "charger" && e.state === 1 && Math.floor(e.ai * 20) % 2 === 0) ||
+        (e.type === "bomber" && e.state === 1 && Math.floor(e.ai * 24) % 2 === 0) ||
+        (e.type === "flyer" && e.state === 1 && Math.floor(e.ai * 20) % 2 === 0) ||
+        (e.type === "brute" && e.state === 1 && Math.floor(e.ai * 16) % 2 === 0);
       ctx.fillStyle = flashing || telegraph ? "#e94b3c" : baseCol;
       ctx.fillRect(e.x - e.w / 2, e.y - e.h, e.w, e.h);
       // eye slit
@@ -2036,6 +2293,16 @@ export class Game {
       if (e.type === "mage") {
         ctx.fillStyle = theme.edge;
         ctx.fillRect(e.x - 3, e.y - e.h - 8, 6, 6);
+      }
+      // 방패병: 방패를 든 동안 정면에 방패 표시
+      if (e.type === "shielder" && (e.state === 1 || e.state === 2)) {
+        ctx.fillStyle = "rgba(143,180,255,0.65)";
+        ctx.fillRect(
+          e.facing > 0 ? e.x + e.w / 2 - 2 : e.x - e.w / 2 - 4,
+          e.y - e.h + 4,
+          6,
+          e.h - 8
+        );
       }
       // hp bar for boss / injured
       if (e.type === "boss" || e.hp < e.maxHp) {
