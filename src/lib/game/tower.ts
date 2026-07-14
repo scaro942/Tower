@@ -1,0 +1,2095 @@
+// Tower — 2D 횡스크롤 액션 로그라이크 엔진 (Canvas 2D)
+// 모든 좌표는 월드 픽셀. 카메라가 플레이어를 팔로우.
+
+export type Vec = { x: number; y: number };
+export type Rect = { x: number; y: number; w: number; h: number };
+
+export type Keys = Record<string, boolean>;
+
+export type FloorRule = {
+  id: string;
+  name: string;
+  desc: string;
+  apply: (g: Game, dt: number) => void;
+  jumpMul?: number; // 점프 속도 배수 (예: 중력 층)
+  dmgTakenMul?: number; // 받는 피해 배수 (예: 불꽃 층)
+  enemyHasteMul?: number; // 적 이동/행동 속도 배수 (예: 광기 층)
+  playerDmgMul?: number; // 플레이어가 주는 피해 배수 (예: 취약 층)
+};
+
+export type Relic = {
+  id: string;
+  name: string;
+  desc: string;
+  apply: (g: Game) => void;
+};
+
+export type SkillDef = {
+  id: string;
+  name: string;
+  desc: string;
+  cooldown: number; // seconds
+  cast: (g: Game) => void;
+};
+
+export type PermStats = {
+  souls: number;
+  strength: number; // +2 atk per level
+  agility: number; // -3% dash cd per level
+  vitality: number; // +8 maxHp per level
+};
+
+const PERM_MAX = 10;
+const PERM_COST = (lvl: number) => 5 + lvl * 5;
+
+export const DEFAULT_PERM: PermStats = {
+  souls: 0,
+  strength: 0,
+  agility: 0,
+  vitality: 0,
+};
+
+const STORAGE_KEY = "tower.perm.v1";
+
+export function loadPerm(): PermStats {
+  if (typeof window === "undefined") return { ...DEFAULT_PERM };
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return { ...DEFAULT_PERM };
+    return { ...DEFAULT_PERM, ...(JSON.parse(raw) as Partial<PermStats>) };
+  } catch {
+    return { ...DEFAULT_PERM };
+  }
+}
+export function savePerm(p: PermStats) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
+  } catch {
+    /* ignore */
+  }
+}
+export function upgradePerm(
+  p: PermStats,
+  key: "strength" | "agility" | "vitality"
+): PermStats {
+  const lvl = p[key];
+  if (lvl >= PERM_MAX) return p;
+  const cost = PERM_COST(lvl);
+  if (p.souls < cost) return p;
+  const next = { ...p, souls: p.souls - cost, [key]: lvl + 1 };
+  savePerm(next);
+  return next;
+}
+export function permCost(p: PermStats, key: "strength" | "agility" | "vitality") {
+  return PERM_COST(p[key]);
+}
+export { PERM_MAX };
+
+// ─── constants ────────────────────────────────────────────────────
+const GRAVITY = 1600;
+const MAX_FALL = 900;
+const MOVE_ACCEL = 3200;
+const MOVE_MAX = 260;
+const FRICTION = 2600;
+const JUMP_V = 560;
+const DOUBLE_JUMP_V = 500;
+const DASH_SPEED = 720;
+const DASH_TIME = 0.16;
+const DASH_CD = 0.7;
+const COMBO_WINDOW = 0.35;
+
+// 탑 최상층. 이 층의 보스를 처치하면 등반 완료(victory).
+export const MAX_FLOOR = 51;
+
+// ─── skills library ────────────────────────────────────────────────
+export const SKILLS: Record<string, SkillDef> = {
+  dashSlash: {
+    id: "dashSlash",
+    name: "질풍참",
+    desc: "전방 대시하며 관통 베기",
+    cooldown: 3.5,
+    cast: (g) => {
+      const p = g.player;
+      p.vx = p.facing * 900;
+      p.iframes = Math.max(p.iframes, 0.25);
+      spawnHitbox(g, {
+        x: p.x + p.facing * 6,
+        y: p.y - 20,
+        w: 90,
+        h: 44,
+        dmg: 14 + g.stats.atk * 0.6,
+        life: 0.18,
+        follow: true,
+        knockback: 260,
+      });
+    },
+  },
+  groundSlam: {
+    id: "groundSlam",
+    name: "지면 강타",
+    desc: "주위를 강타하는 광역 공격",
+    cooldown: 5,
+    cast: (g) => {
+      const p = g.player;
+      spawnHitbox(g, {
+        x: p.x - 70,
+        y: p.y - 10,
+        w: 140,
+        h: 60,
+        dmg: 22 + g.stats.atk * 0.7,
+        life: 0.22,
+        knockback: 340,
+      });
+      g.shake = Math.max(g.shake, 10);
+    },
+  },
+  swordRain: {
+    id: "swordRain",
+    name: "검우",
+    desc: "화면 전체에 검이 쏟아진다 (궁극기)",
+    cooldown: 22,
+    cast: (g) => {
+      const p = g.player;
+      for (let i = 0; i < 8; i++) {
+        setTimeout(() => {
+          if (g.destroyed || g.phase !== "playing") return;
+          const x = p.x - 260 + i * 65 + (Math.random() - 0.5) * 40;
+          spawnHitbox(g, {
+            x: x - 22,
+            y: g.groundY - 60,
+            w: 44,
+            h: 80,
+            dmg: 18 + g.stats.atk * 0.5,
+            life: 0.14,
+            knockback: 180,
+          });
+          g.shake = Math.max(g.shake, 6);
+        }, i * 80);
+      }
+    },
+  },
+
+  // ── 광전사 스킬 ──
+  whirlwind: {
+    id: "whirlwind",
+    name: "회전 베기",
+    desc: "주위를 두 번 휩쓰는 광역 연타",
+    cooldown: 4,
+    cast: (g) => {
+      const p = g.player;
+      spawnHitbox(g, {
+        x: p.x - 80,
+        y: p.y - 50,
+        w: 160,
+        h: 60,
+        dmg: 16 + g.stats.atk * 0.6,
+        life: 0.15,
+        knockback: 200,
+      });
+      setTimeout(() => {
+        if (g.destroyed || g.phase !== "playing") return;
+        spawnHitbox(g, {
+          x: p.x - 80,
+          y: p.y - 50,
+          w: 160,
+          h: 60,
+          dmg: 16 + g.stats.atk * 0.6,
+          life: 0.15,
+          knockback: 260,
+        });
+        g.shake = Math.max(g.shake, 8);
+      }, 180);
+    },
+  },
+  bloodFury: {
+    id: "bloodFury",
+    name: "피의 격노",
+    desc: "HP를 대가로 공격력이 잠시 폭증 (궁극기)",
+    cooldown: 20,
+    cast: (g) => {
+      g.player.hp = Math.max(1, g.player.hp - g.stats.maxHp * 0.1);
+      g.buffAtk = Math.max(g.buffAtk, 6);
+      g.buffAtkTimer = Math.max(g.buffAtkTimer, 6);
+      for (let i = 0; i < 14; i++) {
+        g.particles.push({
+          x: g.player.x,
+          y: g.player.y - 26,
+          vx: (Math.random() - 0.5) * 200,
+          vy: -80 - Math.random() * 160,
+          life: 0.5,
+          color: "#e94b3c",
+        });
+      }
+      g.shake = Math.max(g.shake, 8);
+    },
+  },
+
+  // ── 수호기사 스킬 ──
+  shieldBash: {
+    id: "shieldBash",
+    name: "방패 강타",
+    desc: "전방을 강타하고 강하게 밀쳐낸다",
+    cooldown: 4,
+    cast: (g) => {
+      const p = g.player;
+      p.vx = p.facing * 300;
+      spawnHitbox(g, {
+        x: p.x + (p.facing > 0 ? 0 : -70),
+        y: p.y - 46,
+        w: 70,
+        h: 52,
+        dmg: 14 + g.stats.atk * 0.5,
+        life: 0.16,
+        knockback: 420,
+      });
+      g.shake = Math.max(g.shake, 6);
+    },
+  },
+  fortify: {
+    id: "fortify",
+    name: "철벽",
+    desc: "잠시 무적이 되고 HP를 회복한다",
+    cooldown: 14,
+    cast: (g) => {
+      g.player.iframes = Math.max(g.player.iframes, 1.6);
+      g.player.hp = Math.min(g.stats.maxHp, g.player.hp + g.stats.maxHp * 0.2);
+      for (let i = 0; i < 12; i++) {
+        g.particles.push({
+          x: g.player.x,
+          y: g.player.y - 26,
+          vx: (Math.random() - 0.5) * 120,
+          vy: -60 - Math.random() * 100,
+          life: 0.6,
+          color: "#8fb4ff",
+        });
+      }
+    },
+  },
+
+  // ── 암살자 스킬 ──
+  shadowStep: {
+    id: "shadowStep",
+    name: "그림자 도약",
+    desc: "전방으로 순간이동하며 관통 피해",
+    cooldown: 3,
+    cast: (g) => {
+      const p = g.player;
+      const nx = Math.max(40, Math.min(g.room.w - 40, p.x + p.facing * 200));
+      spawnHitbox(g, {
+        x: Math.min(p.x, nx) - 10,
+        y: p.y - 44,
+        w: Math.abs(nx - p.x) + 20,
+        h: 48,
+        dmg: 16 + g.stats.atk * 0.5,
+        life: 0.12,
+        knockback: 120,
+      });
+      p.x = nx;
+      p.iframes = Math.max(p.iframes, 0.2);
+      for (let i = 0; i < 8; i++) {
+        g.particles.push({
+          x: p.x,
+          y: p.y - 26,
+          vx: (Math.random() - 0.5) * 160,
+          vy: -60 - Math.random() * 120,
+          life: 0.4,
+          color: "#bfa9e6",
+        });
+      }
+    },
+  },
+  fanOfKnives: {
+    id: "fanOfKnives",
+    name: "비수 난무",
+    desc: "부채꼴로 단검을 흩뿌린다 (궁극기)",
+    cooldown: 16,
+    cast: (g) => {
+      const p = g.player;
+      for (let i = -3; i <= 3; i++) {
+        const ang = (i / 3) * 0.6;
+        g.projectiles.push({
+          x: p.x,
+          y: p.y - 26,
+          vx: p.facing * Math.cos(ang) * 520,
+          vy: Math.sin(ang) * 520,
+          w: 14,
+          h: 6,
+          life: 1.2,
+          dmg: 12 + g.stats.atk * 0.4,
+          fromEnemy: false,
+        });
+      }
+      g.shake = Math.max(g.shake, 6);
+    },
+  },
+};
+export const RELICS: Relic[] = [
+  { id: "sharpEdge", name: "예리한 날", desc: "공격력 +6", apply: (g) => (g.stats.atk += 6) },
+  {
+    id: "ironHeart",
+    name: "강철 심장",
+    desc: "최대 HP +30, 완전 회복",
+    apply: (g) => {
+      g.stats.maxHp += 30;
+      g.player.hp = g.stats.maxHp;
+    },
+  },
+  {
+    id: "swiftBoots",
+    name: "질풍의 장화",
+    desc: "이동속도 +15%, 대시 쿨 -20%",
+    apply: (g) => {
+      g.stats.moveMul *= 1.15;
+      g.stats.dashCdMul *= 0.8;
+    },
+  },
+  {
+    id: "berserker",
+    name: "광전사의 문양",
+    desc: "HP 50% 이하에서 공격력 +40%",
+    apply: (g) => g.stats.berserker++,
+  },
+  {
+    id: "vampire",
+    name: "흡혈의 인장",
+    desc: "적 처치 시 HP +4 회복",
+    apply: (g) => g.stats.lifesteal += 4,
+  },
+  {
+    id: "airMaster",
+    name: "공중술사",
+    desc: "삼단 점프, 공중 공격 피해 +25%",
+    apply: (g) => {
+      g.stats.maxJumps = 3;
+      g.stats.airDmgMul *= 1.25;
+    },
+  },
+  {
+    id: "combo",
+    name: "연격의 도",
+    desc: "3타 마무리 공격이 2배 피해",
+    apply: (g) => (g.stats.finisherMul *= 2),
+  },
+];
+
+// ─── classes (전직) ────────────────────────────────────────────────
+export type ClassId = "wanderer" | "berserker" | "guardian" | "assassin";
+
+export type ClassDef = {
+  id: ClassId;
+  name: string;
+  desc: string;
+  color: string;
+  loadout: [string, string, string]; // K/L/I 스킬
+  apply: (g: Game) => void; // 스탯 보정 (reset 시 적용)
+};
+
+export const CLASSES: Record<ClassId, ClassDef> = {
+  wanderer: {
+    id: "wanderer",
+    name: "방랑자",
+    desc: "균형 잡힌 기본 전사",
+    color: "#f5f5f5",
+    loadout: ["dashSlash", "groundSlam", "swordRain"],
+    apply: () => {},
+  },
+  berserker: {
+    id: "berserker",
+    name: "광전사",
+    desc: "공격력 대폭 상승·최대 HP 감소. 처치 시 공격속도 급증.",
+    color: "#e94b3c",
+    loadout: ["whirlwind", "dashSlash", "bloodFury"],
+    apply: (g) => {
+      g.stats.atk = Math.round(g.stats.atk * 1.35);
+      g.stats.maxHp = Math.round(g.stats.maxHp * 0.8);
+      g.stats.lifesteal += 2;
+      g.stats.killHaste = 1;
+    },
+  },
+  guardian: {
+    id: "guardian",
+    name: "수호기사",
+    desc: "최대 HP 상승·받는 피해 감소. 느리지만 단단하다.",
+    color: "#8fb4ff",
+    loadout: ["shieldBash", "groundSlam", "fortify"],
+    apply: (g) => {
+      g.stats.maxHp = Math.round(g.stats.maxHp * 1.35);
+      g.stats.dmgTakenMul *= 0.8;
+      g.stats.moveMul *= 0.92;
+      g.stats.atk = Math.round(g.stats.atk * 0.95);
+    },
+  },
+  assassin: {
+    id: "assassin",
+    name: "암살자",
+    desc: "빠른 이동·대시, 높은 치명타. 유리 대포.",
+    color: "#bfa9e6",
+    loadout: ["shadowStep", "dashSlash", "fanOfKnives"],
+    apply: (g) => {
+      g.stats.moveMul *= 1.18;
+      g.stats.dashCdMul *= 0.7;
+      g.stats.critChance += 0.3;
+      g.stats.critMul = 2.2;
+      g.stats.maxHp = Math.round(g.stats.maxHp * 0.9);
+      g.stats.maxJumps = 3;
+    },
+  },
+};
+
+// 전직 제단이 등장하는 층 (해당 층 진입 시 선택 기회)
+export const CLASS_ALTAR_FLOORS = [5, 25];
+
+// ─── floor rules ───────────────────────────────────────────────────
+export const FLOOR_RULES: Record<number, FloorRule> = {
+  8: {
+    id: "brittle",
+    name: "쇠약",
+    desc: "받는 피해 +15%",
+    apply: () => {},
+    dmgTakenMul: 1.15,
+  },
+  15: {
+    id: "poison",
+    name: "독안개",
+    desc: "HP가 지속적으로 감소한다",
+    apply: (g, dt) => {
+      g.player.hp -= 2 * dt;
+    },
+  },
+  22: {
+    id: "frenzy",
+    name: "광기",
+    desc: "적의 움직임이 빨라진다",
+    apply: () => {},
+    enemyHasteMul: 1.4,
+  },
+  28: {
+    id: "gravity",
+    name: "중력 증가",
+    desc: "점프력이 감소한다",
+    apply: () => {},
+    jumpMul: 0.7,
+  },
+  35: {
+    id: "bloodpact",
+    name: "피의 계약",
+    desc: "주는 피해 +30%, HP가 서서히 감소",
+    apply: (g, dt) => {
+      g.player.hp -= 1.5 * dt;
+    },
+    playerDmgMul: 1.3,
+  },
+  44: {
+    id: "thinair",
+    name: "희박한 공기",
+    desc: "점프력 감소 + 적 가속",
+    apply: () => {},
+    jumpMul: 0.8,
+    enemyHasteMul: 1.25,
+  },
+  51: {
+    id: "flame",
+    name: "불꽃 정상",
+    desc: "받는 피해 +25%, 적 가속",
+    apply: () => {},
+    dmgTakenMul: 1.25,
+    enemyHasteMul: 1.2,
+  },
+};
+
+// ─── entities ──────────────────────────────────────────────────────
+export type Player = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  w: number;
+  h: number;
+  facing: 1 | -1;
+  onGround: boolean;
+  jumpsLeft: number;
+  hp: number;
+  dashCd: number;
+  dashTime: number;
+  dashDir: number;
+  iframes: number;
+  comboIdx: number;
+  comboTimer: number;
+  attackTimer: number;
+  skillCd: [number, number, number];
+  hurtFlash: number;
+};
+
+export type Enemy = {
+  id: number;
+  type: "grunt" | "archer" | "charger" | "mage" | "boss";
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  w: number;
+  h: number;
+  hp: number;
+  maxHp: number;
+  facing: 1 | -1;
+  onGround: boolean;
+  ai: number; // timer
+  atkCd: number;
+  hurtFlash: number;
+  dmg: number;
+  dead: boolean;
+  dying: number;
+  phase: number;
+  state: number; // 적별 상태 머신 (0=idle/추적, 1=준비, 2=행동)
+  stateTimer: number;
+  bossKind?: BossKind; // 보스 종류 (type === "boss"일 때만)
+};
+
+export type BossKind = "warden" | "plaguelord" | "stormknight" | "infernal";
+
+export type BossInfo = {
+  kind: BossKind;
+  name: string;
+  color: string;
+};
+
+export const BOSS_INFO: Record<BossKind, BossInfo> = {
+  warden: { kind: "warden", name: "감옥의 간수", color: "#f0f0f0" },
+  plaguelord: { kind: "plaguelord", name: "역병군주", color: "#8fe3a2" },
+  stormknight: { kind: "stormknight", name: "폭풍기사", color: "#8fb4ff" },
+  infernal: { kind: "infernal", name: "화염군주", color: "#ff8f6b" },
+};
+
+// 층/구간에 맞는 보스 종류
+export function bossKindForFloor(floor: number): BossKind {
+  if (floor >= 51) return "infernal";
+  if (floor >= 28) return "stormknight";
+  if (floor >= 15) return "plaguelord";
+  return "warden";
+}
+
+export type Hitbox = Rect & {
+  dmg: number;
+  life: number;
+  follow?: boolean;
+  fromEnemy?: boolean;
+  knockback?: number;
+  hits: Set<number>;
+};
+
+export type Projectile = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  w: number;
+  h: number;
+  life: number;
+  dmg: number;
+  fromEnemy: boolean;
+  homing?: number; // 초당 방향 보정 강도 (마법사 탄)
+};
+
+// 바닥 장판(경고 후 발동하는 위험지대)
+export type Hazard = {
+  x: number;
+  y: number;
+  r: number; // 반경
+  dmg: number;
+  warn: number; // 경고 남은 시간 (이 동안은 무해)
+  active: number; // 발동 지속 시간
+  hit: boolean; // 이번 발동에서 이미 피해를 줬는지
+};
+
+export type Room = {
+  w: number;
+  platforms: Rect[];
+  enemies: Enemy[];
+  doorOpen: boolean;
+  cleared: boolean;
+  isBoss: boolean;
+  index: number;
+};
+
+export type Stats = {
+  maxHp: number;
+  atk: number;
+  moveMul: number;
+  dashCdMul: number;
+  maxJumps: number;
+  airDmgMul: number;
+  finisherMul: number;
+  berserker: number;
+  lifesteal: number;
+  dmgTakenMul: number; // 직업/유물에 의한 받는 피해 배수
+  critChance: number; // 0~1
+  critMul: number; // 크리티컬 배수
+  killHaste: number; // 처치 시 얻는 공격속도 버프 강도 (0=없음)
+};
+
+export type Phase =
+  | "playing"
+  | "reward"
+  | "class_select"
+  | "dead"
+  | "victory"
+  | "cleared_floor";
+
+export type RewardChoice = { kind: "relic"; relic: Relic } | { kind: "heal" };
+
+// ─── helpers ───────────────────────────────────────────────────────
+function overlap(a: Rect, b: Rect) {
+  return (
+    a.x < b.x + b.w &&
+    a.x + a.w > b.x &&
+    a.y < b.y + b.h &&
+    a.y + a.h > b.y
+  );
+}
+
+let hbId = 0;
+function spawnHitbox(g: Game, o: Omit<Hitbox, "hits">) {
+  g.hitboxes.push({ ...o, hits: new Set() });
+  hbId++;
+}
+
+let enId = 0;
+function makeEnemy(type: Enemy["type"], x: number, y: number): Enemy {
+  const base: Enemy = {
+    id: ++enId,
+    type,
+    x,
+    y,
+    vx: 0,
+    vy: 0,
+    w: 32,
+    h: 44,
+    hp: 20,
+    maxHp: 20,
+    facing: -1,
+    onGround: false,
+    ai: 0,
+    atkCd: 0,
+    hurtFlash: 0,
+    dmg: 8,
+    dead: false,
+    dying: 0,
+    phase: 0,
+    state: 0,
+    stateTimer: 0,
+  };
+  if (type === "grunt") {
+    return { ...base, hp: 22, maxHp: 22, w: 32, h: 44, dmg: 10 };
+  }
+  if (type === "archer") {
+    return { ...base, hp: 14, maxHp: 14, w: 30, h: 42, dmg: 8 };
+  }
+  if (type === "charger") {
+    return { ...base, hp: 30, maxHp: 30, w: 36, h: 40, dmg: 14 };
+  }
+  if (type === "mage") {
+    return { ...base, hp: 16, maxHp: 16, w: 30, h: 46, dmg: 7 };
+  }
+  // boss
+  return {
+    ...base,
+    hp: 240,
+    maxHp: 240,
+    w: 68,
+    h: 92,
+    dmg: 20,
+  };
+}
+
+// ─── tower zones (층 구간별 테마) ──────────────────────────────────
+export type TowerTheme = {
+  id: string;
+  name: string;
+  bg: string; // 배경 기본색
+  fog: string; // 대기 라인/분위기색
+  platform: string; // 플랫폼 색
+  edge: string; // 플랫폼 윗면 하이라이트
+  enemyPool: Enemy["type"][]; // 이 구간의 일반 적 풀
+};
+
+export const TOWER_ZONES: { from: number; theme: TowerTheme }[] = [
+  {
+    from: 1,
+    theme: {
+      id: "dungeon",
+      name: "지하 감옥",
+      bg: "#141414",
+      fog: "rgba(255,255,255,0.03)",
+      platform: "#1c1c1c",
+      edge: "#f5f5f5",
+      enemyPool: ["grunt", "grunt", "archer"],
+    },
+  },
+  {
+    from: 15,
+    theme: {
+      id: "poison",
+      name: "독의 소굴",
+      bg: "#0f1710",
+      fog: "rgba(120,220,140,0.05)",
+      platform: "#16241a",
+      edge: "#8fe3a2",
+      enemyPool: ["grunt", "archer", "charger"],
+    },
+  },
+  {
+    from: 28,
+    theme: {
+      id: "garden",
+      name: "공중 정원",
+      bg: "#0d1220",
+      fog: "rgba(140,180,255,0.05)",
+      platform: "#161f33",
+      edge: "#8fb4ff",
+      enemyPool: ["charger", "archer", "mage"],
+    },
+  },
+  {
+    from: 51,
+    theme: {
+      id: "summit",
+      name: "화염 정상",
+      bg: "#1a0d0b",
+      fog: "rgba(255,120,90,0.06)",
+      platform: "#2a1512",
+      edge: "#ff8f6b",
+      enemyPool: ["charger", "mage", "grunt"],
+    },
+  },
+];
+
+export function themeForFloor(floor: number): TowerTheme {
+  let chosen = TOWER_ZONES[0].theme;
+  for (const z of TOWER_ZONES) {
+    if (floor >= z.from) chosen = z.theme;
+  }
+  return chosen;
+}
+
+function pickEnemyType(floor: number): Enemy["type"] {
+  const pool = themeForFloor(floor).enemyPool;
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+function generateRoom(
+  floor: number,
+  index: number,
+  isBoss: boolean,
+  groundY: number
+): Room {
+  const w = isBoss ? 1400 : 1100 + Math.floor(Math.random() * 400);
+  const platforms: Rect[] = [];
+  // ground
+  platforms.push({ x: 0, y: groundY, w, h: 200 });
+  // walls
+  platforms.push({ x: -40, y: 0, w: 40, h: groundY + 40 });
+  platforms.push({ x: w, y: 0, w: 40, h: groundY + 40 });
+  if (!isBoss) {
+    const nP = 2 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < nP; i++) {
+      const pw = 90 + Math.random() * 120;
+      const px = 180 + (i * (w - 300)) / nP + Math.random() * 60;
+      const py = groundY - 90 - Math.random() * 150;
+      platforms.push({ x: px, y: py, w: pw, h: 18 });
+    }
+  } else {
+    // two side platforms
+    platforms.push({ x: 180, y: groundY - 130, w: 180, h: 18 });
+    platforms.push({ x: w - 360, y: groundY - 130, w: 180, h: 18 });
+  }
+
+  const enemies: Enemy[] = [];
+  if (isBoss) {
+    const boss = makeEnemy("boss", w / 2, groundY - 100);
+    boss.bossKind = bossKindForFloor(floor);
+    // 종류별 기본 스탯 편차
+    if (boss.bossKind === "plaguelord") {
+      boss.hp = boss.maxHp = 220;
+      boss.w = 60;
+      boss.h = 88;
+    } else if (boss.bossKind === "stormknight") {
+      boss.hp = boss.maxHp = 200;
+      boss.w = 56;
+      boss.h = 96;
+      boss.dmg = 24;
+    } else if (boss.bossKind === "infernal") {
+      boss.hp = boss.maxHp = 300;
+      boss.w = 76;
+      boss.h = 100;
+      boss.dmg = 24;
+    }
+    // scale by floor
+    boss.hp = boss.maxHp = Math.round(boss.maxHp * (1 + (floor - 1) * 0.2));
+    boss.dmg = Math.round(boss.dmg * (1 + (floor - 1) * 0.15));
+    enemies.push(boss);
+  } else {
+    const count = 2 + Math.floor(Math.random() * 3) + Math.min(2, index);
+    for (let i = 0; i < count; i++) {
+      const t = pickEnemyType(floor);
+      const ex = 260 + Math.random() * (w - 500);
+      const ey = groundY - 60;
+      const e = makeEnemy(t, ex, ey);
+      e.hp = e.maxHp = Math.round(e.maxHp * (1 + (floor - 1) * 0.15));
+      e.dmg = Math.round(e.dmg * (1 + (floor - 1) * 0.1));
+      enemies.push(e);
+    }
+  }
+  return { w, platforms, enemies, doorOpen: false, cleared: false, isBoss, index };
+}
+
+// ─── Game ──────────────────────────────────────────────────────────
+export class Game {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  keys: Keys = {};
+  destroyed = false;
+
+  player!: Player;
+  stats!: Stats;
+  room!: Room;
+  floor = 1;
+  roomIndex = 0;
+  roomsPerFloor = 4; // 3 combat + 1 boss
+  hitboxes: Hitbox[] = [];
+  projectiles: Projectile[] = [];
+  hazards: Hazard[] = [];
+  particles: { x: number; y: number; vx: number; vy: number; life: number; color: string }[] = [];
+  camera = { x: 0, y: 0 };
+  shake = 0;
+  groundY = 520;
+
+  phase: Phase = "playing";
+  rewardChoices: RewardChoice[] = [];
+  earnedSouls = 0; // 아직 로비에 저장되지 않은(위험) 영혼
+  runSouls = 0; // 이번 런에서 획득한 총 영혼 (표시용)
+
+  skillLoadout: [string, string, string] = ["dashSlash", "groundSlam", "swordRain"];
+
+  playerClass: ClassId = "wanderer"; // 현재 런의 직업
+  pendingClassChoice = false; // 전직 제단 도달 여부
+  buffAtk = 0; // 임시 공격력 가산 (피의 격노 등)
+  buffAtkTimer = 0;
+  killHasteTimer = 0; // 처치 시 공격속도 버프 잔여 시간
+  appliedRelics: Relic[] = []; // 이번 런에서 획득한 유물 (전직 시 재적용용)
+
+  onStateChange?: () => void;
+  onSoulsEarned?: (souls: number) => void;
+
+  perm: PermStats;
+
+  private lastT = 0;
+  private raf = 0;
+  private lastAttackPress = false;
+  private lastSkillPress = [false, false, false];
+  private lastDashPress = false;
+  private lastJumpPress = false;
+  private lastInteractPress = false;
+
+  constructor(canvas: HTMLCanvasElement, perm: PermStats) {
+    this.canvas = canvas;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("no canvas ctx");
+    this.ctx = ctx;
+    this.perm = perm;
+    this.reset();
+    this.attachInput();
+    this.raf = requestAnimationFrame(this.loop);
+  }
+
+  emit() {
+    this.onStateChange?.();
+  }
+
+  reset() {
+    const baseHp = 100 + this.perm.vitality * 8;
+    const baseAtk = 10 + this.perm.strength * 2;
+    this.stats = {
+      maxHp: baseHp,
+      atk: baseAtk,
+      moveMul: 1 + this.perm.agility * 0.02,
+      dashCdMul: 1 - this.perm.agility * 0.03,
+      maxJumps: 2,
+      airDmgMul: 1,
+      finisherMul: 1.6,
+      berserker: 0,
+      lifesteal: 0,
+      dmgTakenMul: 1,
+      critChance: 0,
+      critMul: 1.8,
+      killHaste: 0,
+    };
+    // 새 런은 방랑자로 시작
+    this.playerClass = "wanderer";
+    this.skillLoadout = [...CLASSES.wanderer.loadout] as [string, string, string];
+    CLASSES.wanderer.apply(this);
+    this.buffAtk = 0;
+    this.buffAtkTimer = 0;
+    this.killHasteTimer = 0;
+    this.pendingClassChoice = false;
+    this.appliedRelics = [];
+    this.player = {
+      x: 120,
+      y: this.groundY - 60,
+      vx: 0,
+      vy: 0,
+      w: 28,
+      h: 52,
+      facing: 1,
+      onGround: false,
+      jumpsLeft: this.stats.maxJumps,
+      hp: this.stats.maxHp,
+      dashCd: 0,
+      dashTime: 0,
+      dashDir: 1,
+      iframes: 0,
+      comboIdx: 0,
+      comboTimer: 0,
+      attackTimer: 0,
+      skillCd: [0, 0, 0],
+      hurtFlash: 0,
+    };
+    this.floor = 1;
+    this.roomIndex = 0;
+    this.earnedSouls = 0;
+    this.runSouls = 0;
+    this.hitboxes = [];
+    this.projectiles = [];
+    this.hazards = [];
+    this.particles = [];
+    this.room = generateRoom(this.floor, 0, false, this.groundY);
+    this.phase = "playing";
+    this.emit();
+  }
+
+  destroy() {
+    this.destroyed = true;
+    cancelAnimationFrame(this.raf);
+    this.detachInput();
+  }
+
+  // ─── input ─────
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.code))
+      e.preventDefault();
+    this.keys[e.code] = true;
+  };
+  private onKeyUp = (e: KeyboardEvent) => {
+    this.keys[e.code] = false;
+  };
+  private attachInput() {
+    window.addEventListener("keydown", this.onKeyDown);
+    window.addEventListener("keyup", this.onKeyUp);
+  }
+  private detachInput() {
+    window.removeEventListener("keydown", this.onKeyDown);
+    window.removeEventListener("keyup", this.onKeyUp);
+  }
+
+  // ─── main loop ─────
+  loop = (t: number) => {
+    if (this.destroyed) return;
+    const dt = Math.min(0.033, (t - (this.lastT || t)) / 1000);
+    this.lastT = t;
+    if (this.phase === "playing") this.update(dt);
+    this.render();
+    this.raf = requestAnimationFrame(this.loop);
+  };
+
+  private update(dt: number) {
+    const p = this.player;
+    const k = this.keys;
+
+    // floor rule
+    const rule = FLOOR_RULES[this.floor];
+    if (rule) rule.apply(this, dt);
+
+    // 직업 버프 타이머
+    if (this.buffAtkTimer > 0) {
+      this.buffAtkTimer -= dt;
+      if (this.buffAtkTimer <= 0) this.buffAtk = 0;
+    }
+    if (this.killHasteTimer > 0) this.killHasteTimer -= dt;
+
+    // input edges
+    const jumpPress = !!(k["Space"] || k["KeyW"] || k["ArrowUp"]);
+    const jumpEdge = jumpPress && !this.lastJumpPress;
+    this.lastJumpPress = jumpPress;
+
+    const attackPress = !!k["KeyJ"];
+    const attackEdge = attackPress && !this.lastAttackPress;
+    this.lastAttackPress = attackPress;
+
+    const dashPress = !!(k["ShiftLeft"] || k["ShiftRight"]);
+    const dashEdge = dashPress && !this.lastDashPress;
+    this.lastDashPress = dashPress;
+
+    const skillKeys: ("KeyK" | "KeyL" | "KeyI")[] = ["KeyK", "KeyL", "KeyI"];
+    const skillEdges = skillKeys.map((sk, i) => {
+      const cur = !!k[sk];
+      const edge = cur && !this.lastSkillPress[i];
+      this.lastSkillPress[i] = cur;
+      return edge;
+    });
+
+    const interactPress = !!(k["KeyE"] || k["ArrowDown"]);
+    const interactEdge = interactPress && !this.lastInteractPress;
+    this.lastInteractPress = interactPress;
+
+    // horizontal input
+    const leftHeld = !!(k["KeyA"] || k["ArrowLeft"]);
+    const rightHeld = !!(k["KeyD"] || k["ArrowRight"]);
+    const dir = (rightHeld ? 1 : 0) + (leftHeld ? -1 : 0);
+
+    // dashing
+    if (p.dashTime > 0) {
+      p.vx = p.dashDir * DASH_SPEED;
+      p.vy = 0;
+      p.iframes = Math.max(p.iframes, 0.05);
+      p.dashTime -= dt;
+    } else {
+      if (dir !== 0) {
+        p.vx += dir * MOVE_ACCEL * dt;
+        p.facing = dir > 0 ? 1 : -1;
+      } else {
+        const decel = Math.min(Math.abs(p.vx), FRICTION * dt);
+        p.vx -= Math.sign(p.vx) * decel;
+      }
+      const maxV = MOVE_MAX * this.stats.moveMul * (p.attackTimer > 0 && p.onGround ? 0.35 : 1);
+      p.vx = Math.max(-maxV, Math.min(maxV, p.vx));
+    }
+
+    // jump
+    if (jumpEdge && p.jumpsLeft > 0 && p.dashTime <= 0) {
+      const jumpMul = FLOOR_RULES[this.floor]?.jumpMul ?? 1;
+      const base = p.jumpsLeft === this.stats.maxJumps ? JUMP_V : DOUBLE_JUMP_V;
+      p.vy = -base * jumpMul;
+      p.jumpsLeft--;
+      p.onGround = false;
+    }
+
+    // dash — cancels attack
+    if (dashEdge && p.dashCd <= 0) {
+      const d = dir !== 0 ? dir : p.facing;
+      p.dashDir = d;
+      p.dashTime = DASH_TIME;
+      p.dashCd = DASH_CD * this.stats.dashCdMul;
+      p.attackTimer = 0;
+      p.comboIdx = 0;
+    }
+    p.dashCd = Math.max(0, p.dashCd - dt);
+
+    // attack — 3-hit combo, air attack allowed
+    if (attackEdge && p.attackTimer <= 0 && p.dashTime <= 0) {
+      const idx = p.comboTimer > 0 ? Math.min(2, p.comboIdx) : 0;
+      p.comboIdx = idx + 1;
+      const hasteMul = this.killHasteTimer > 0 ? 0.6 : 1; // 처치 버프 시 연타 가속
+      p.attackTimer = (idx === 2 ? 0.32 : 0.22) * hasteMul;
+      p.comboTimer = COMBO_WINDOW;
+      const isFinisher = idx === 2;
+      const airMul = p.onGround ? 1 : this.stats.airDmgMul;
+      const effAtk = this.stats.atk + this.buffAtk;
+      let dmg = (7 + effAtk * 0.9) * airMul;
+      if (isFinisher) dmg *= this.stats.finisherMul;
+      if (this.stats.berserker > 0 && p.hp < this.stats.maxHp * 0.5)
+        dmg *= 1 + 0.4 * this.stats.berserker;
+      const range = isFinisher ? 72 : 56;
+      spawnHitbox(this, {
+        x: p.x + (p.facing > 0 ? 4 : -range - 4),
+        y: p.y - 34,
+        w: range,
+        h: 46,
+        dmg,
+        life: 0.12,
+        follow: false,
+        knockback: isFinisher ? 340 : 140,
+      });
+    }
+
+    // skills
+    skillEdges.forEach((edge, i) => {
+      if (!edge) return;
+      if (p.skillCd[i] > 0) return;
+      const s = SKILLS[this.skillLoadout[i]];
+      if (!s) return;
+      s.cast(this);
+      p.skillCd[i] = s.cooldown;
+    });
+    p.skillCd = p.skillCd.map((c) => Math.max(0, c - dt)) as [number, number, number];
+
+    // combo timer
+    p.comboTimer = Math.max(0, p.comboTimer - dt);
+    if (p.attackTimer > 0) p.attackTimer -= dt;
+    if (p.comboTimer <= 0 && p.attackTimer <= 0) p.comboIdx = 0;
+
+    // gravity
+    p.vy += GRAVITY * dt;
+    p.vy = Math.min(p.vy, MAX_FALL);
+
+    // move + collide
+    this.movePlayer(dt);
+
+    if (p.iframes > 0) p.iframes -= dt;
+    if (p.hurtFlash > 0) p.hurtFlash -= dt;
+
+    // hitboxes lifetime + follow
+    for (const hb of this.hitboxes) {
+      hb.life -= dt;
+      if (hb.follow) {
+        hb.x = p.x + (p.facing > 0 ? 6 : -hb.w - 6);
+        hb.y = p.y - 20;
+      }
+    }
+    this.hitboxes = this.hitboxes.filter((h) => h.life > 0);
+
+    // enemies
+    for (const e of this.room.enemies) {
+      if (e.dead) {
+        e.dying -= dt;
+        continue;
+      }
+      this.updateEnemy(e, dt);
+    }
+    // apply hitboxes vs enemies (player hitboxes)
+    const pdMul = FLOOR_RULES[this.floor]?.playerDmgMul ?? 1;
+    for (const hb of this.hitboxes) {
+      if (hb.fromEnemy) continue;
+      for (const e of this.room.enemies) {
+        if (e.dead) continue;
+        if (hb.hits.has(e.id)) continue;
+        if (overlap(hb, { x: e.x - e.w / 2, y: e.y - e.h, w: e.w, h: e.h })) {
+          this.damageEnemy(e, hb.dmg * pdMul, hb.knockback ?? 0, p.facing);
+          hb.hits.add(e.id);
+        }
+      }
+    }
+    // enemy hitboxes vs player
+    for (const hb of this.hitboxes) {
+      if (!hb.fromEnemy) continue;
+      if (p.iframes > 0) continue;
+      if (
+        overlap(hb, {
+          x: p.x - p.w / 2,
+          y: p.y - p.h,
+          w: p.w,
+          h: p.h,
+        })
+      ) {
+        this.damagePlayer(hb.dmg);
+        break;
+      }
+    }
+
+    // projectiles
+    for (const pr of this.projectiles) {
+      if (pr.homing && pr.fromEnemy) {
+        // 현재 속도 방향을 플레이어 쪽으로 서서히 회전
+        const speed = Math.hypot(pr.vx, pr.vy) || 1;
+        const desired = Math.atan2(p.y - 24 - pr.y, p.x - pr.x);
+        let cur = Math.atan2(pr.vy, pr.vx);
+        let diff = desired - cur;
+        while (diff > Math.PI) diff -= Math.PI * 2;
+        while (diff < -Math.PI) diff += Math.PI * 2;
+        const maxTurn = pr.homing * dt;
+        cur += Math.max(-maxTurn, Math.min(maxTurn, diff));
+        pr.vx = Math.cos(cur) * speed;
+        pr.vy = Math.sin(cur) * speed;
+      }
+      pr.x += pr.vx * dt;
+      pr.y += pr.vy * dt;
+      pr.life -= dt;
+      if (pr.fromEnemy) {
+        if (p.iframes <= 0 &&
+          overlap(pr, { x: p.x - p.w / 2, y: p.y - p.h, w: p.w, h: p.h })) {
+          this.damagePlayer(pr.dmg);
+          pr.life = 0;
+        }
+      } else {
+        // 플레이어 투사체 → 적
+        for (const e of this.room.enemies) {
+          if (e.dead) continue;
+          if (overlap(pr, { x: e.x - e.w / 2, y: e.y - e.h, w: e.w, h: e.h })) {
+            this.damageEnemy(e, pr.dmg, 60, Math.sign(pr.vx) || p.facing);
+            pr.life = 0;
+            break;
+          }
+        }
+      }
+    }
+    this.projectiles = this.projectiles.filter((pr) => pr.life > 0);
+
+    // hazards (바닥 장판)
+    for (const hz of this.hazards) {
+      if (hz.warn > 0) {
+        hz.warn -= dt;
+        continue;
+      }
+      hz.active -= dt;
+      // 발동 중 플레이어가 범위에 있으면 1회 피해
+      if (!hz.hit && p.iframes <= 0) {
+        const px = p.x;
+        const py = p.y - p.h / 2;
+        if (Math.abs(px - hz.x) < hz.r && Math.abs(py - hz.y) < 80) {
+          this.damagePlayer(hz.dmg);
+          hz.hit = true;
+        }
+      }
+    }
+    this.hazards = this.hazards.filter((hz) => hz.warn > 0 || hz.active > 0);
+
+    // particles
+    for (const pa of this.particles) {
+      pa.x += pa.vx * dt;
+      pa.y += pa.vy * dt;
+      pa.vy += GRAVITY * 0.4 * dt;
+      pa.life -= dt;
+    }
+    this.particles = this.particles.filter((pa) => pa.life > 0);
+
+    // clear dead
+    this.room.enemies = this.room.enemies.filter((e) => !(e.dead && e.dying <= 0));
+    if (!this.room.cleared && this.room.enemies.length === 0) {
+      this.room.cleared = true;
+      this.room.doorOpen = true;
+      this.emit();
+    }
+
+    // camera
+    const canvasW = this.canvas.width / devicePixelRatioSafe();
+    const canvasH = this.canvas.height / devicePixelRatioSafe();
+    const targetX = Math.max(
+      0,
+      Math.min(this.room.w - canvasW, p.x - canvasW / 2)
+    );
+    const targetY = Math.max(-100, Math.min(0, p.y - canvasH * 0.65));
+    this.camera.x += (targetX - this.camera.x) * Math.min(1, dt * 8);
+    this.camera.y += (targetY - this.camera.y) * Math.min(1, dt * 8);
+    if (this.shake > 0) this.shake = Math.max(0, this.shake - dt * 30);
+
+    // death
+    if (p.hp <= 0 && this.phase === "playing") {
+      this.phase = "dead";
+      this.bankSouls();
+      this.emit();
+    }
+
+    // interact — enter door
+    if (interactEdge && this.room.doorOpen) {
+      const doorX = this.room.w - 60;
+      if (Math.abs(p.x - doorX) < 60 && p.onGround) {
+        if (this.room.isBoss) this.ackFloorClear();
+        else this.nextRoom();
+      }
+    }
+  }
+
+  private movePlayer(dt: number) {
+    const p = this.player;
+    // X
+    p.x += p.vx * dt;
+    for (const pl of this.room.platforms) {
+      const box = { x: p.x - p.w / 2, y: p.y - p.h, w: p.w, h: p.h };
+      if (overlap(pl, box)) {
+        if (p.vx > 0) p.x = pl.x - p.w / 2;
+        else if (p.vx < 0) p.x = pl.x + pl.w + p.w / 2;
+        p.vx = 0;
+      }
+    }
+    // Y
+    p.y += p.vy * dt;
+    p.onGround = false;
+    for (const pl of this.room.platforms) {
+      const box = { x: p.x - p.w / 2, y: p.y - p.h, w: p.w, h: p.h };
+      if (overlap(pl, box)) {
+        if (p.vy > 0) {
+          p.y = pl.y;
+          p.vy = 0;
+          p.onGround = true;
+          p.jumpsLeft = this.stats.maxJumps;
+        } else if (p.vy < 0) {
+          p.y = pl.y + pl.h + p.h;
+          p.vy = 0;
+        }
+      }
+    }
+  }
+
+  private updateEnemy(e: Enemy, dtRaw: number) {
+    const haste = FLOOR_RULES[this.floor]?.enemyHasteMul ?? 1;
+    const dt = dtRaw * haste;
+    const p = this.player;
+    const dx = p.x - e.x;
+    e.facing = dx >= 0 ? 1 : -1;
+    e.ai += dt;
+    e.atkCd = Math.max(0, e.atkCd - dt);
+    if (e.hurtFlash > 0) e.hurtFlash -= dt;
+
+    // gravity (haste 영향 제외 — 낙하는 일정하게)
+    e.vy += GRAVITY * dtRaw;
+    e.vy = Math.min(e.vy, MAX_FALL);
+
+    if (e.type === "grunt") {
+      const dist = Math.abs(dx);
+      if (dist > 40) e.vx = e.facing * 90;
+      else e.vx *= 0.7;
+      if (dist < 44 && e.atkCd <= 0 && Math.abs(p.y - e.y) < 60) {
+        e.atkCd = 1.1;
+        spawnHitbox(this, {
+          x: e.x + (e.facing > 0 ? 0 : -46),
+          y: e.y - 40,
+          w: 46,
+          h: 40,
+          dmg: e.dmg,
+          life: 0.18,
+          fromEnemy: true,
+        });
+      }
+    } else if (e.type === "archer") {
+      e.vx *= 0.85;
+      if (e.atkCd <= 0 && Math.abs(dx) < 520) {
+        e.atkCd = 1.6;
+        this.projectiles.push({
+          x: e.x,
+          y: e.y - 24,
+          vx: e.facing * 360,
+          vy: 0,
+          w: 14,
+          h: 6,
+          life: 2,
+          dmg: e.dmg,
+          fromEnemy: true,
+        });
+      }
+    } else if (e.type === "charger") {
+      // 돌격병: 감지 → 준비(멈칫) → 돌진 → 경직 사이클
+      const dist = Math.abs(dx);
+      if (e.state === 0) {
+        // 추적: 사거리 밖이면 천천히 접근
+        if (dist > 260) e.vx = e.facing * 70;
+        else e.vx *= 0.7;
+        if (dist < 260 && e.atkCd <= 0 && Math.abs(p.y - e.y) < 70) {
+          e.state = 1;
+          e.stateTimer = 0.45; // 돌진 예비 동작
+          e.vx = 0;
+        }
+      } else if (e.state === 1) {
+        e.vx *= 0.6;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          e.state = 2;
+          e.stateTimer = 0.55; // 돌진 지속
+        }
+      } else if (e.state === 2) {
+        e.vx = e.facing * 460;
+        e.stateTimer -= dt;
+        // 돌진 중 접촉 판정
+        if (dist < 40 && Math.abs(p.y - e.y) < 60) {
+          spawnHitbox(this, {
+            x: e.x - 24,
+            y: e.y - 40,
+            w: 48,
+            h: 44,
+            dmg: e.dmg,
+            life: 0.1,
+            fromEnemy: true,
+            knockback: 300,
+          });
+          e.state = 3;
+          e.stateTimer = 0.7;
+        }
+        if (e.stateTimer <= 0) {
+          e.state = 3;
+          e.stateTimer = 0.7; // 빗나간 뒤 경직
+        }
+      } else {
+        // 경직: 무방비
+        e.vx *= 0.8;
+        e.stateTimer -= dt;
+        if (e.stateTimer <= 0) {
+          e.state = 0;
+          e.atkCd = 0.6;
+        }
+      }
+    } else if (e.type === "mage") {
+      // 마법사: 거리 유지 + 유도 3연발, 접근당하면 순간이동
+      const dist = Math.abs(dx);
+      e.vx *= 0.85;
+      if (dist < 150) {
+        // 너무 가까움 → 블링크로 이탈
+        if (e.atkCd <= 0) {
+          const away = -e.facing;
+          const nx = e.x + away * 260;
+          e.x = Math.max(40, Math.min(this.room.w - 40, nx));
+          e.atkCd = 1.2;
+          for (let i = 0; i < 8; i++) {
+            this.particles.push({
+              x: e.x,
+              y: e.y - e.h / 2,
+              vx: (Math.random() - 0.5) * 160,
+              vy: -60 - Math.random() * 120,
+              life: 0.4,
+              color: themeForFloor(this.floor).edge,
+            });
+          }
+        }
+      } else if (e.atkCd <= 0 && dist < 620) {
+        // 유도 탄 3연발
+        e.atkCd = 2.4;
+        const baseAng = Math.atan2(p.y - 24 - (e.y - 30), p.x - e.x);
+        for (let i = -1; i <= 1; i++) {
+          const ang = baseAng + i * 0.22;
+          this.projectiles.push({
+            x: e.x,
+            y: e.y - 30,
+            vx: Math.cos(ang) * 240,
+            vy: Math.sin(ang) * 240,
+            w: 12,
+            h: 12,
+            life: 2.6,
+            dmg: e.dmg,
+            fromEnemy: true,
+            homing: 2.2,
+          });
+        }
+      }
+    } else {
+      // boss — 종류별 AI로 분기
+      switch (e.bossKind) {
+        case "plaguelord":
+          this.aiPlaguelord(e, dx, dt);
+          break;
+        case "stormknight":
+          this.aiStormknight(e, dx, dt);
+          break;
+        case "infernal":
+          this.aiInfernal(e, dx, dt);
+          break;
+        default:
+          this.aiWarden(e, dx, dt);
+      }
+    }
+
+    // move + collide with ground/platforms
+    e.x += e.vx * dt;
+    e.y += e.vy * dtRaw;
+    e.onGround = false;
+    for (const pl of this.room.platforms) {
+      const box = { x: e.x - e.w / 2, y: e.y - e.h, w: e.w, h: e.h };
+      if (overlap(pl, box)) {
+        if (e.vy > 0 && box.y + box.h - e.vy * dt <= pl.y + 4) {
+          e.y = pl.y;
+          e.vy = 0;
+          e.onGround = true;
+        } else if (e.vx > 0) {
+          e.x = pl.x - e.w / 2;
+          e.vx = 0;
+        } else if (e.vx < 0) {
+          e.x = pl.x + pl.w + e.w / 2;
+          e.vx = 0;
+        }
+      }
+    }
+    // clamp inside room
+    e.x = Math.max(20, Math.min(this.room.w - 20, e.x));
+  }
+
+  // ─── boss AIs ──────────────────────────────────────────────────────
+  // 감옥의 간수: 근접 강타 + 3방향 탄 (기본형, 반피에서 가속)
+  private aiWarden(e: Enemy, dx: number, dt: number) {
+    const dist = Math.abs(dx);
+    if (e.hp < e.maxHp * 0.5) e.phase = 1;
+    const speed = e.phase === 1 ? 160 : 110;
+    if (dist > 80) e.vx = e.facing * speed;
+    else e.vx *= 0.6;
+    if (e.atkCd <= 0) {
+      if (dist < 130) {
+        e.atkCd = e.phase === 1 ? 1.0 : 1.4;
+        spawnHitbox(this, {
+          x: e.x + (e.facing > 0 ? 0 : -110),
+          y: e.y - 80,
+          w: 110,
+          h: 80,
+          dmg: e.dmg,
+          life: 0.22,
+          fromEnemy: true,
+          knockback: 260,
+        });
+        this.shake = Math.max(this.shake, 6);
+      } else if (dist < 500) {
+        e.atkCd = 2.2;
+        for (let i = -1; i <= 1; i++) {
+          this.projectiles.push({
+            x: e.x,
+            y: e.y - 60,
+            vx: e.facing * 300,
+            vy: i * 80,
+            w: 18,
+            h: 8,
+            life: 2.5,
+            dmg: e.dmg * 0.6,
+            fromEnemy: true,
+          });
+        }
+      }
+    }
+  }
+
+  // 역병군주: 거리 유지, 독장판 소환 + 유도탄 난사
+  private aiPlaguelord(e: Enemy, dx: number, dt: number) {
+    const dist = Math.abs(dx);
+    if (e.hp < e.maxHp * 0.5) e.phase = 1;
+    // 플레이어와 중간 거리 유지
+    if (dist < 220) e.vx = -e.facing * 90;
+    else if (dist > 360) e.vx = e.facing * 90;
+    else e.vx *= 0.7;
+    if (e.atkCd <= 0) {
+      const roll = Math.random();
+      if (roll < 0.5) {
+        // 독장판을 플레이어 발밑에 소환
+        e.atkCd = e.phase === 1 ? 1.8 : 2.6;
+        this.spawnHazard(this.player.x, this.groundY, 90, e.dmg * 0.5);
+      } else {
+        // 유도탄 부채꼴
+        e.atkCd = e.phase === 1 ? 1.6 : 2.2;
+        const n = e.phase === 1 ? 5 : 3;
+        const base = Math.atan2(this.player.y - 24 - (e.y - 40), this.player.x - e.x);
+        for (let i = 0; i < n; i++) {
+          const ang = base + (i - (n - 1) / 2) * 0.25;
+          this.projectiles.push({
+            x: e.x,
+            y: e.y - 40,
+            vx: Math.cos(ang) * 200,
+            vy: Math.sin(ang) * 200,
+            w: 12,
+            h: 12,
+            life: 3,
+            dmg: e.dmg * 0.6,
+            fromEnemy: true,
+            homing: 1.6,
+          });
+        }
+      }
+    }
+  }
+
+  // 폭풍기사: 순간이동 접근 → 돌진 베기, 원거리에선 낙뢰
+  private aiStormknight(e: Enemy, dx: number, dt: number) {
+    const dist = Math.abs(dx);
+    if (e.hp < e.maxHp * 0.5) e.phase = 1;
+    e.vx *= 0.85;
+    if (e.state === 0) {
+      if (e.atkCd <= 0) {
+        e.state = 1;
+        e.stateTimer = 0.5;
+        // 플레이어 근처로 순간이동
+        const side = this.player.x > e.x ? -1 : 1;
+        e.x = Math.max(60, Math.min(this.room.w - 60,
+          this.player.x + side * 90));
+        for (let i = 0; i < 10; i++) {
+          this.particles.push({
+            x: e.x,
+            y: e.y - e.h / 2,
+            vx: (Math.random() - 0.5) * 200,
+            vy: -80 - Math.random() * 140,
+            life: 0.4,
+            color: "#8fb4ff",
+          });
+        }
+      }
+    } else if (e.state === 1) {
+      // 돌진 베기 예비
+      e.stateTimer -= dt;
+      if (e.stateTimer <= 0) {
+        e.state = 0;
+        e.atkCd = e.phase === 1 ? 1.4 : 2.0;
+        spawnHitbox(this, {
+          x: e.x - 70,
+          y: e.y - 80,
+          w: 140,
+          h: 90,
+          dmg: e.dmg,
+          life: 0.2,
+          fromEnemy: true,
+          knockback: 300,
+        });
+        this.shake = Math.max(this.shake, 8);
+        // 반피 이후엔 낙뢰 추가
+        if (e.phase === 1) {
+          for (let i = -2; i <= 2; i++) {
+            const lx = this.player.x + i * 110;
+            this.spawnHazard(lx, this.groundY, 40, e.dmg * 0.6, 0.7);
+          }
+        }
+      }
+    }
+  }
+
+  // 화염군주: 화염 파도(바닥 장판 확산) + 잡몹 소환
+  private aiInfernal(e: Enemy, dx: number, dt: number) {
+    const dist = Math.abs(dx);
+    if (e.hp < e.maxHp * 0.5) e.phase = 1;
+    if (dist > 120) e.vx = e.facing * (e.phase === 1 ? 130 : 90);
+    else e.vx *= 0.6;
+    if (e.atkCd <= 0) {
+      const roll = Math.random();
+      if (dist < 150 && roll < 0.4) {
+        // 근접 화염 강타
+        e.atkCd = 1.6;
+        spawnHitbox(this, {
+          x: e.x - 90,
+          y: e.y - 80,
+          w: 180,
+          h: 90,
+          dmg: e.dmg,
+          life: 0.22,
+          fromEnemy: true,
+          knockback: 280,
+        });
+        this.shake = Math.max(this.shake, 8);
+      } else if (roll < 0.75) {
+        // 화염 파도: 양옆으로 퍼지는 장판
+        e.atkCd = e.phase === 1 ? 2.2 : 3.0;
+        const step = 90;
+        const n = e.phase === 1 ? 6 : 4;
+        for (let i = 1; i <= n; i++) {
+          this.spawnHazard(e.x + i * step, this.groundY, 50, e.dmg * 0.5, 0.5 + i * 0.12);
+          this.spawnHazard(e.x - i * step, this.groundY, 50, e.dmg * 0.5, 0.5 + i * 0.12);
+        }
+        this.shake = Math.max(this.shake, 6);
+      } else {
+        // 잡몹 소환 (최대 인원 제한)
+        e.atkCd = 4;
+        const alive = this.room.enemies.filter((x) => !x.dead && x.type !== "boss").length;
+        if (alive < 3) {
+          for (let i = -1; i <= 1; i += 2) {
+            const add = makeEnemy("grunt", e.x + i * 80, this.groundY - 60);
+            add.hp = add.maxHp = Math.round(add.maxHp * (1 + (this.floor - 1) * 0.15));
+            add.dmg = Math.round(add.dmg * (1 + (this.floor - 1) * 0.1));
+            this.room.enemies.push(add);
+          }
+        }
+      }
+    }
+  }
+
+  // 바닥 장판 위험지대 생성
+  private spawnHazard(x: number, y: number, r: number, dmg: number, delay = 0.35) {
+    this.hazards.push({
+      x,
+      y,
+      r,
+      dmg,
+      warn: delay,
+      active: 0.6,
+      hit: false,
+    });
+  }
+
+  private damageEnemy(e: Enemy, dmg: number, kb: number, facing: number) {
+    // 치명타 판정
+    let d = dmg;
+    let crit = false;
+    if (this.stats.critChance > 0 && Math.random() < this.stats.critChance) {
+      d *= this.stats.critMul;
+      crit = true;
+    }
+    e.hp -= d;
+    e.hurtFlash = 0.12;
+    e.vx += facing * kb;
+    e.vy = Math.min(e.vy, -80);
+    this.shake = Math.max(this.shake, crit ? 5 : 3);
+    for (let i = 0; i < (crit ? 7 : 4); i++) {
+      this.particles.push({
+        x: e.x,
+        y: e.y - e.h / 2,
+        vx: facing * (60 + Math.random() * 120),
+        vy: -80 - Math.random() * 120,
+        life: 0.4,
+        color: crit ? "#ffe08a" : "#ffffff",
+      });
+    }
+    if (e.hp <= 0) {
+      e.dead = true;
+      e.dying = 0.3;
+      const reward =
+        e.type === "boss"
+          ? 30
+          : e.type === "charger"
+            ? 5
+            : e.type === "mage"
+              ? 5
+              : e.type === "archer"
+                ? 4
+                : 3;
+      this.earnedSouls += reward;
+      this.runSouls += reward;
+      if (this.stats.lifesteal > 0) {
+        this.player.hp = Math.min(
+          this.stats.maxHp,
+          this.player.hp + this.stats.lifesteal
+        );
+      }
+      // 광전사: 처치 시 공격속도 버프 갱신
+      if (this.stats.killHaste > 0) {
+        this.killHasteTimer = 3;
+      }
+      for (let i = 0; i < 12; i++) {
+        this.particles.push({
+          x: e.x,
+          y: e.y - e.h / 2,
+          vx: (Math.random() - 0.5) * 260,
+          vy: -140 - Math.random() * 180,
+          life: 0.6 + Math.random() * 0.4,
+          color: "#ffffff",
+        });
+      }
+      this.emit();
+    }
+  }
+
+  private damagePlayer(dmg: number) {
+    let d = dmg;
+    d *= FLOOR_RULES[this.floor]?.dmgTakenMul ?? 1;
+    d *= this.stats.dmgTakenMul; // 직업/유물 방어
+    this.player.hp -= d;
+    this.player.iframes = 0.6;
+    this.player.hurtFlash = 0.2;
+    this.player.vy = -220;
+    this.player.vx += -this.player.facing * 180;
+    this.shake = Math.max(this.shake, 8);
+    this.emit();
+  }
+
+  // ─── room progression ─────
+  private nextRoom() {
+    this.roomIndex++;
+    const boss = this.roomIndex >= this.roomsPerFloor - 1;
+    // reward before every room (except first)
+    if (!boss) {
+      this.buildRewards();
+      this.phase = "reward";
+      this.emit();
+      return;
+    }
+    // going into boss room — small reward first
+    this.buildRewards();
+    this.phase = "reward";
+    this.emit();
+  }
+
+  private buildRewards() {
+    const pool = [...RELICS].sort(() => Math.random() - 0.5).slice(0, 2);
+    const choices: RewardChoice[] = pool.map((r) => ({ kind: "relic", relic: r }));
+    choices.push({ kind: "heal" });
+    this.rewardChoices = choices;
+  }
+
+  chooseReward(idx: number) {
+    const c = this.rewardChoices[idx];
+    if (!c) return;
+    if (c.kind === "relic") {
+      c.relic.apply(this);
+      this.appliedRelics.push(c.relic);
+    } else this.player.hp = Math.min(this.stats.maxHp, this.player.hp + 40);
+    this.rewardChoices = [];
+
+    // spawn next room
+    const isBoss = this.roomIndex >= this.roomsPerFloor - 1;
+    this.room = generateRoom(this.floor, this.roomIndex, isBoss, this.groundY);
+    this.player.x = 100;
+    this.player.y = this.groundY - 60;
+    this.player.vx = 0;
+    this.player.vy = 0;
+    this.hitboxes = [];
+    this.projectiles = [];
+    this.hazards = [];
+    this.camera.x = 0;
+    this.phase = "playing";
+    this.emit();
+  }
+
+  advanceFloor() {
+    this.floor++;
+    this.roomIndex = 0;
+    this.room = generateRoom(this.floor, 0, false, this.groundY);
+    this.player.x = 100;
+    this.player.y = this.groundY - 60;
+    this.player.vx = 0;
+    this.player.vy = 0;
+    this.hitboxes = [];
+    this.projectiles = [];
+    this.hazards = [];
+    this.camera.x = 0;
+    // 전직 제단 층이면 선택 화면을 먼저 띄운다 (아직 방랑자일 때만)
+    if (CLASS_ALTAR_FLOORS.includes(this.floor) && this.playerClass === "wanderer") {
+      this.phase = "class_select";
+    } else {
+      this.phase = "playing";
+    }
+    this.emit();
+  }
+
+  // 전직 선택. class_select 화면에서 호출.
+  chooseClass(id: ClassId) {
+    if (this.phase !== "class_select") return;
+    this.playerClass = id;
+    // 스탯을 처음부터 다시 계산해 직업 보정을 적용 (HP 비율 보존)
+    const hpRatio = this.player.hp / this.stats.maxHp;
+    const baseHp = 100 + this.perm.vitality * 8;
+    const baseAtk = 10 + this.perm.strength * 2;
+    this.stats = {
+      maxHp: baseHp,
+      atk: baseAtk,
+      moveMul: 1 + this.perm.agility * 0.02,
+      dashCdMul: 1 - this.perm.agility * 0.03,
+      maxJumps: 2,
+      airDmgMul: 1,
+      finisherMul: 1.6,
+      berserker: 0,
+      lifesteal: 0,
+      dmgTakenMul: 1,
+      critChance: 0,
+      critMul: 1.8,
+      killHaste: 0,
+    };
+    // 직업 보정을 재적용하고, 이번 런에서 먹은 유물 효과도 다시 적용
+    CLASSES[id].apply(this);
+    for (const r of this.appliedRelics) r.apply(this);
+    this.skillLoadout = [...CLASSES[id].loadout] as [string, string, string];
+    this.player.hp = Math.min(this.stats.maxHp, Math.max(1, this.stats.maxHp * hpRatio));
+    this.player.skillCd = [0, 0, 0];
+    this.phase = "playing";
+    this.emit();
+  }
+
+  // 그동안 모은 영혼을 로비(영구 저장)에 커밋. 중복 적립 방지.
+  private bankSouls() {
+    const gained = this.earnedSouls;
+    if (gained <= 0) return;
+    this.perm = { ...this.perm, souls: this.perm.souls + gained };
+    savePerm(this.perm);
+    this.onSoulsEarned?.(gained);
+    this.earnedSouls = 0;
+  }
+
+  // 보스 처치 후 UI에서 호출. 최상층이면 완주, 아니면 다음 층 진입 대기.
+  ackFloorClear() {
+    if (this.floor >= MAX_FLOOR) {
+      this.bankSouls();
+      this.phase = "victory";
+      this.emit();
+      return;
+    }
+    // 중간 층 클리어: 영혼을 안전하게 저장하고 다음 층 진입 대기 화면으로.
+    this.bankSouls();
+    this.phase = "cleared_floor";
+    this.emit();
+  }
+
+  // cleared_floor 화면에서 "다음 층으로" 선택 시 호출.
+  ackNextFloor() {
+    if (this.phase !== "cleared_floor") return;
+    this.advanceFloor();
+  }
+
+  // ─── rendering ─────
+  private render() {
+    const dpr = devicePixelRatioSafe();
+    const ctx = this.ctx;
+    const W = this.canvas.width / dpr;
+    const H = this.canvas.height / dpr;
+    const theme = themeForFloor(this.floor);
+
+    // background — 위로 갈수록 어두워지는 세로 그라데이션
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, shade(theme.bg, -8));
+    grad.addColorStop(1, theme.bg);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+
+    // vertical tower atmosphere lines
+    ctx.strokeStyle = theme.fog;
+    ctx.lineWidth = 1;
+    for (let i = 0; i < 20; i++) {
+      const x = ((i * 80 - this.camera.x * 0.3) % (W + 160)) - 40;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, H);
+      ctx.stroke();
+    }
+
+    // shake
+    const sx = (Math.random() - 0.5) * this.shake;
+    const sy = (Math.random() - 0.5) * this.shake;
+    ctx.translate(-this.camera.x + sx, -this.camera.y + sy);
+
+    // platforms
+    for (const pl of this.room.platforms) {
+      // ground extra shadow
+      ctx.fillStyle = theme.platform;
+      ctx.fillRect(pl.x, pl.y, pl.w, pl.h);
+      ctx.fillStyle = theme.edge;
+      ctx.fillRect(pl.x, pl.y, pl.w, 2);
+    }
+
+    // door
+    if (this.room.doorOpen) {
+      const dx = this.room.w - 80;
+      const dy = this.groundY - 96;
+      ctx.strokeStyle = "#f5f5f5";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(dx, dy, 44, 96);
+      ctx.fillStyle = "rgba(245,245,245,0.08)";
+      ctx.fillRect(dx, dy, 44, 96);
+      ctx.fillStyle = "#f5f5f5";
+      ctx.font = "12px 'JetBrains Mono', monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("[E]", dx + 22, dy - 8);
+    }
+
+    // particles
+    for (const pa of this.particles) {
+      ctx.globalAlpha = Math.max(0, pa.life);
+      ctx.fillStyle = pa.color;
+      ctx.fillRect(pa.x - 1.5, pa.y - 1.5, 3, 3);
+    }
+    ctx.globalAlpha = 1;
+
+    // hazards (바닥 장판) — 경고는 외곽선, 발동은 채워진 붉은 영역
+    for (const hz of this.hazards) {
+      const warning = hz.warn > 0;
+      ctx.globalAlpha = warning
+        ? 0.3 + 0.3 * Math.abs(Math.sin(hz.warn * 12))
+        : 0.4;
+      ctx.fillStyle = warning ? "rgba(233,75,60,0.5)" : "#e94b3c";
+      ctx.fillRect(hz.x - hz.r, hz.y - 8, hz.r * 2, 10);
+      if (warning) {
+        ctx.strokeStyle = "#e94b3c";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(hz.x - hz.r, hz.y - 70, hz.r * 2, 78);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // projectiles — 아군은 흰색, 마법사 탄은 테마색, 그 외 붉은색
+    for (const pr of this.projectiles) {
+      if (!pr.fromEnemy) {
+        ctx.fillStyle = "#f5f5f5";
+        ctx.fillRect(pr.x - pr.w / 2, pr.y - pr.h / 2, pr.w, pr.h);
+      } else if (pr.homing) {
+        ctx.fillStyle = theme.edge;
+        ctx.beginPath();
+        ctx.arc(pr.x, pr.y, pr.w / 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = "#e94b3c";
+        ctx.fillRect(pr.x - pr.w / 2, pr.y - pr.h / 2, pr.w, pr.h);
+      }
+    }
+
+    // enemies
+    for (const e of this.room.enemies) {
+      const alpha = e.dead ? Math.max(0, e.dying / 0.3) : 1;
+      ctx.globalAlpha = alpha;
+      // 타입별 기본 실루엣 색
+      const baseCol =
+        e.type === "charger"
+          ? "#d9b38c"
+          : e.type === "mage"
+            ? "#bfa9e6"
+            : e.type === "archer"
+              ? "#cfd6c0"
+              : e.type === "boss"
+                ? (e.bossKind ? BOSS_INFO[e.bossKind].color : "#f0f0f0")
+                : "#e9e9e9";
+      const flashing = e.hurtFlash > 0;
+      // 돌격병 준비 상태(state 1)일 때 붉게 점멸 — 회피 텔레그래프
+      const telegraph =
+        e.type === "charger" && e.state === 1 && Math.floor(e.ai * 20) % 2 === 0;
+      ctx.fillStyle = flashing || telegraph ? "#e94b3c" : baseCol;
+      ctx.fillRect(e.x - e.w / 2, e.y - e.h, e.w, e.h);
+      // eye slit
+      ctx.fillStyle = "#141414";
+      const eyeY = e.y - e.h + 12;
+      ctx.fillRect(
+        e.facing > 0 ? e.x + 2 : e.x - 10,
+        eyeY,
+        8,
+        3
+      );
+      // 마법사: 머리 위 룬 표식
+      if (e.type === "mage") {
+        ctx.fillStyle = theme.edge;
+        ctx.fillRect(e.x - 3, e.y - e.h - 8, 6, 6);
+      }
+      // hp bar for boss / injured
+      if (e.type === "boss" || e.hp < e.maxHp) {
+        const bw = e.w + 10;
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(e.x - bw / 2, e.y - e.h - 10, bw, 4);
+        ctx.fillStyle = "#e94b3c";
+        ctx.fillRect(e.x - bw / 2, e.y - e.h - 10, bw * (e.hp / e.maxHp), 4);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // player
+    const p = this.player;
+    const pFlash = p.hurtFlash > 0 || p.iframes > 0.3;
+    ctx.globalAlpha = p.iframes > 0 ? 0.6 : 1;
+    ctx.fillStyle = pFlash ? "#e94b3c" : "#f5f5f5";
+    ctx.fillRect(p.x - p.w / 2, p.y - p.h, p.w, p.h);
+    // face direction slit
+    ctx.fillStyle = "#141414";
+    ctx.fillRect(p.facing > 0 ? p.x + 2 : p.x - 10, p.y - p.h + 14, 8, 3);
+    ctx.globalAlpha = 1;
+    // sword indicator for attack
+    if (p.attackTimer > 0) {
+      ctx.strokeStyle = "#f5f5f5";
+      ctx.lineWidth = 3;
+      const reach = p.comboIdx === 3 ? 72 : 56;
+      ctx.beginPath();
+      ctx.moveTo(p.x + (p.facing > 0 ? 4 : -4), p.y - 30);
+      ctx.lineTo(p.x + p.facing * reach, p.y - 30);
+      ctx.stroke();
+    }
+    // dash trail
+    if (p.dashTime > 0) {
+      ctx.fillStyle = "rgba(245,245,245,0.25)";
+      ctx.fillRect(p.x - p.w / 2 - p.dashDir * 20, p.y - p.h, p.w, p.h);
+    }
+
+    // reset transform for HUD-like overlays not needed (React handles)
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // floor rule banner
+    const rule = FLOOR_RULES[this.floor];
+    if (rule) {
+      ctx.fillStyle = "rgba(233,75,60,0.15)";
+      ctx.fillRect(0, 0, W, 4);
+    }
+  }
+}
+
+function devicePixelRatioSafe() {
+  if (typeof window === "undefined") return 1;
+  return Math.min(2, window.devicePixelRatio || 1);
+}
+
+// #rrggbb 색을 amt(-100~100)만큼 밝게/어둡게 조정
+function shade(hex: string, amt: number): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return hex;
+  const n = parseInt(m[1], 16);
+  const clamp = (v: number) => Math.max(0, Math.min(255, v));
+  const r = clamp(((n >> 16) & 255) + amt);
+  const g = clamp(((n >> 8) & 255) + amt);
+  const b = clamp((n & 255) + amt);
+  return `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0")}`;
+}
