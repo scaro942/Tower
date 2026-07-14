@@ -2333,9 +2333,11 @@ export class Game {
         // 피격/예고 시 붉은 점멸
         const blink = (flashing || telegraph) && Math.floor(e.ai * 30) % 2 === 0;
         ctx.globalAlpha = alpha * (blink ? 0.4 : 1);
+        // 원본이 왼쪽 향하는 세트면 향함 판정을 반대로.
+        const facesLeft = setName ? SPRITE_FACES_LEFT.has(setName) : false;
+        const drawFlipped = facesLeft ? e.facing > 0 : e.facing < 0;
         ctx.save();
-        // 스프라이트 원본이 오른쪽 향함 → 왼쪽(facing<0) 향할 때만 뒤집기
-        if (e.facing < 0) {
+        if (drawFlipped) {
           ctx.translate(e.x, 0);
           ctx.scale(-1, 1);
           ctx.drawImage(img, -dw / 2, drawTop, dw, dh);
@@ -2407,8 +2409,10 @@ export class Game {
       // 피격 시 점멸 (iframes 잔량으로 위상 생성)
       const blink = pFlash && Math.floor(p.iframes * 30) % 2 === 0;
       ctx.globalAlpha *= blink ? 0.35 : 1;
+      const facesLeft = spriteName ? SPRITE_FACES_LEFT.has(spriteName) : false;
+      const drawFlipped = facesLeft ? p.facing > 0 : p.facing < 0;
       ctx.save();
-      if (p.facing < 0) {
+      if (drawFlipped) {
         ctx.translate(p.x, 0);
         ctx.scale(-1, 1);
         ctx.drawImage(img, -dw / 2, footY - dh, dw, dh);
@@ -2487,6 +2491,18 @@ const BOSS_SPRITE: Record<BossKind, string> = {
   stormknight: "stormknight",
   infernal: "infernal",
 };
+
+// 원본 스프라이트가 "왼쪽"을 바라보는 세트 목록.
+// 게임 기본 향함은 오른쪽이므로, 여기 포함된 세트는 렌더 시 뒤집기 방향을
+// 반대로 적용한다. (프레임끼리는 이미 방향 통일됨 — 여기선 세트 전체의
+// 절대 방향만 지정.) 게임에서 반대로 걷는 캐릭터가 있으면 이 목록에서
+// 넣고/빼면 된다.
+const SPRITE_FACES_LEFT = new Set<string>([
+  "berserker",
+  "grunt",
+  "shielder",
+  "flyer",
+]);
 
 type SpriteSet = { frames: HTMLImageElement[]; loaded: boolean };
 const spriteCache: Record<string, SpriteSet> = {};
