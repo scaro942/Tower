@@ -11,6 +11,9 @@ import "@fontsource/noto-sans-kr/700.css";
 
 import "./styles.css";
 import { TowerGame } from "./components/TowerGame";
+import { preloadSprites } from "./lib/game/tower";
+
+preloadSprites();
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
