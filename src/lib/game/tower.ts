@@ -1407,7 +1407,11 @@ export class Game {
     const dt = dtRaw * haste;
     const p = this.player;
     const dx = p.x - e.x;
-    e.facing = dx >= 0 ? 1 : -1;
+    // 방패병은 방어/강타 중(state 1·2) 즉시 회전하지 않는다. 그래야 뒤로 돌아
+    // 등을 치는 카운터플레이가 성립한다. 그 외에는 플레이어를 향한다.
+    if (!(e.type === "shielder" && (e.state === 1 || e.state === 2))) {
+      e.facing = dx >= 0 ? 1 : -1;
+    }
     e.ai += dt;
     e.atkCd = Math.max(0, e.atkCd - dt);
     if (e.hurtFlash > 0) e.hurtFlash -= dt;
@@ -1543,23 +1547,29 @@ export class Game {
         }
       }
     } else if (e.type === "shielder") {
-      // 방패병: 접근 → 방패를 들고 압박(피해 대폭 감소) → 방패 강타
+      // 방패병: 접근 → 방패를 들고 압박(정면 공격 거의 무효) → 방패 강타
       const dist = Math.abs(dx);
       if (e.state === 0) {
         if (dist > 60) e.vx = e.facing * 80;
         else e.vx *= 0.6;
-        if (dist < 130 && e.atkCd <= 0) {
+        // 플레이어가 사거리에 들어오면 즉시 방패를 든다 (쿨다운 짧게)
+        if (dist < 160 && e.atkCd <= 0) {
           e.state = 1;
-          e.stateTimer = 1.1; // 방패 든 채 압박
+          e.stateTimer = 1.6; // 방패 든 채 압박 (길게 유지)
         }
       } else if (e.state === 1) {
-        if (dist > 50) e.vx = e.facing * 50;
+        // 방패를 든 채 플레이어에게 천천히 다가간다 (방패 방향은 고정, 이동만 추적)
+        const toward = dx >= 0 ? 1 : -1;
+        if (dist > 46) e.vx = toward * 55;
         else e.vx *= 0.6;
         e.stateTimer -= dt;
-        if (e.stateTimer <= 0) {
+        // 가까우면 강타로 전환, 아니면 방어를 계속 유지
+        if (e.stateTimer <= 0 && dist < 80) {
           e.state = 2;
           e.stateTimer = 0.25; // 강타 예비 동작
           e.vx = 0;
+        } else if (e.stateTimer <= 0) {
+          e.stateTimer = 0.6; // 아직 멀면 방어 자세 연장
         }
       } else if (e.state === 2) {
         e.vx *= 0.4;
@@ -1578,7 +1588,7 @@ export class Game {
             });
           }
           e.state = 0;
-          e.atkCd = 0.9;
+          e.atkCd = 0.5; // 강타 후 짧은 쿨다운 → 방어 사이클 자주
         }
       }
     } else if (e.type === "bomber") {
@@ -1943,8 +1953,45 @@ export class Game {
       d *= this.stats.critMul;
       crit = true;
     }
-    // 방패병: 방패를 든 상태(state 1)에서는 받는 피해가 크게 줄어든다
-    if (e.type === "shielder" && e.state === 1) d *= 0.35;
+    // 방패병 방어: 방패를 든 상태(state 1·2)이고, 공격이 정면(방패 쪽)에서
+    // 오면 거의 무효화한다. 등 뒤에서 맞으면 그대로 관통.
+    // facing = 공격자가 미는 방향(오른쪽 공격이면 +1). 방패병이 그 반대쪽을
+    // 바라보고 있을 때(공격을 마주볼 때) 방패로 막는다.
+    let blocked = false;
+    if (
+      e.type === "shielder" &&
+      (e.state === 1 || e.state === 2) &&
+      e.facing === -facing
+    ) {
+      d *= 0.1; // 90% 감소 — 거의 막아냄
+      blocked = true;
+      crit = false; // 막힌 공격은 치명타 무효
+    }
+
+    if (blocked) {
+      // 막힘 연출: 방패 위치에서 푸른 스파크 튀김 + 공격자 넉백 반사
+      const sx = e.x + e.facing * (e.w / 2);
+      const sy = e.y - e.h * 0.55;
+      for (let i = 0; i < 10; i++) {
+        this.particles.push({
+          x: sx,
+          y: sy,
+          vx: -facing * (80 + Math.random() * 160),
+          vy: -60 - Math.random() * 140,
+          life: 0.35,
+          color: i % 2 === 0 ? "#bfe0ff" : "#ffffff",
+        });
+      }
+      // 플레이어를 살짝 밀어내 "튕겨나간" 느낌
+      this.player.vx += facing * 120;
+      this.shake = Math.max(this.shake, 4);
+      e.hp -= d;
+      e.hurtFlash = 0.08;
+      // 막았으므로 큰 넉백·띄우기는 생략
+      this.emit();
+      return;
+    }
+
     e.hp -= d;
     e.hurtFlash = 0.12;
     e.vx += facing * kb;
@@ -2252,25 +2299,7 @@ export class Game {
     for (const e of this.room.enemies) {
       const alpha = e.dead ? Math.max(0, e.dying / 0.3) : 1;
       ctx.globalAlpha = alpha;
-      // 타입별 기본 실루엣 색
-      const baseCol =
-        e.type === "charger"
-          ? "#d9b38c"
-          : e.type === "mage"
-            ? "#bfa9e6"
-            : e.type === "archer"
-              ? "#cfd6c0"
-              : e.type === "shielder"
-                ? "#7a8fa6"
-                : e.type === "bomber"
-                  ? "#e0a25c"
-                  : e.type === "flyer"
-                    ? "#5c6b8a"
-                    : e.type === "brute"
-                      ? "#8a5a4a"
-                      : e.type === "boss"
-                        ? (e.bossKind ? BOSS_INFO[e.bossKind].color : "#f0f0f0")
-                        : "#e9e9e9";
+
       const flashing = e.hurtFlash > 0;
       // 상태별 공격 예고 점멸 — 돌격병 돌진, 폭탄병 점화, 비행형 급강하
       const telegraph =
@@ -2278,31 +2307,73 @@ export class Game {
         (e.type === "bomber" && e.state === 1 && Math.floor(e.ai * 24) % 2 === 0) ||
         (e.type === "flyer" && e.state === 1 && Math.floor(e.ai * 20) % 2 === 0) ||
         (e.type === "brute" && e.state === 1 && Math.floor(e.ai * 16) % 2 === 0);
-      ctx.fillStyle = flashing || telegraph ? "#e94b3c" : baseCol;
-      ctx.fillRect(e.x - e.w / 2, e.y - e.h, e.w, e.h);
-      // eye slit
-      ctx.fillStyle = "#141414";
-      const eyeY = e.y - e.h + 12;
-      ctx.fillRect(
-        e.facing > 0 ? e.x + 2 : e.x - 10,
-        eyeY,
-        8,
-        3
-      );
-      // 마법사: 머리 위 룬 표식
-      if (e.type === "mage") {
-        ctx.fillStyle = theme.edge;
-        ctx.fillRect(e.x - 3, e.y - e.h - 8, 6, 6);
+
+      // 스프라이트 결정 (보스 → 종류별, 일반 → 타입별)
+      const setName =
+        e.type === "boss"
+          ? e.bossKind
+            ? BOSS_SPRITE[e.bossKind]
+            : undefined
+          : ENEMY_SPRITE[e.type];
+      const eset = setName ? loadSpriteSet(setName) : null;
+
+      if (eset && eset.loaded) {
+        // 걷기/비행 애니메이션. flyer는 항상 날갯짓, 그 외는 지상 이동 시.
+        const animating =
+          e.type === "flyer" || (Math.abs(e.vx) > 15 && e.onGround);
+        const frame = animating ? Math.floor(e.ai * 6) % 4 : 0;
+        const img = eset.frames[frame];
+        // 보스는 크게, 일반은 히트박스 높이에 맞춰
+        const targetH = e.h * (e.type === "boss" ? 1.7 : 1.85);
+        const scale = targetH / img.height;
+        const dw = img.width * scale;
+        const dh = img.height * scale;
+        // flyer는 공중 부유체라 중심 정렬, 나머지는 발바닥(하단) 정렬
+        const drawTop = e.type === "flyer" ? e.y - e.h / 2 - dh / 2 : e.y - dh;
+        // 피격/예고 시 붉은 점멸
+        const blink = (flashing || telegraph) && Math.floor(e.ai * 30) % 2 === 0;
+        ctx.globalAlpha = alpha * (blink ? 0.4 : 1);
+        ctx.save();
+        // 스프라이트 원본이 오른쪽 향함 → 왼쪽(facing<0) 향할 때만 뒤집기
+        if (e.facing < 0) {
+          ctx.translate(e.x, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(img, -dw / 2, drawTop, dw, dh);
+        } else {
+          ctx.drawImage(img, e.x - dw / 2, drawTop, dw, dh);
+        }
+        ctx.restore();
+        ctx.globalAlpha = alpha;
+      } else {
+        // 폴백: 기존 사각형 + 눈
+        const baseCol =
+          e.type === "charger" ? "#d9b38c"
+          : e.type === "mage" ? "#bfa9e6"
+          : e.type === "archer" ? "#cfd6c0"
+          : e.type === "shielder" ? "#7a8fa6"
+          : e.type === "bomber" ? "#e0a25c"
+          : e.type === "flyer" ? "#5c6b8a"
+          : e.type === "brute" ? "#8a5a4a"
+          : e.type === "boss" ? (e.bossKind ? BOSS_INFO[e.bossKind].color : "#f0f0f0")
+          : "#e9e9e9";
+        ctx.fillStyle = flashing || telegraph ? "#e94b3c" : baseCol;
+        ctx.fillRect(e.x - e.w / 2, e.y - e.h, e.w, e.h);
+        ctx.fillStyle = "#141414";
+        ctx.fillRect(e.facing > 0 ? e.x + 2 : e.x - 10, e.y - e.h + 12, 8, 3);
       }
-      // 방패병: 방패를 든 동안 정면에 방패 표시
+
+      // 방패병: 방패를 든 동안 정면에 방패 표시 (스프라이트 위에 덧그림)
       if (e.type === "shielder" && (e.state === 1 || e.state === 2)) {
-        ctx.fillStyle = "rgba(143,180,255,0.65)";
-        ctx.fillRect(
-          e.facing > 0 ? e.x + e.w / 2 - 2 : e.x - e.w / 2 - 4,
-          e.y - e.h + 4,
-          6,
-          e.h - 8
-        );
+        const sx = e.facing > 0 ? e.x + e.w / 2 - 1 : e.x - e.w / 2 - 5;
+        const sy = e.y - e.h + 2;
+        const sh = e.h - 6;
+        // 방패 본체 (푸른 금속판)
+        ctx.fillStyle = "rgba(160,195,255,0.85)";
+        ctx.fillRect(sx, sy, 7, sh);
+        // 방어 광채 (은은한 외곽)
+        ctx.strokeStyle = "rgba(200,225,255,0.7)";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(sx - 1, sy - 1, 9, sh + 2);
       }
       // hp bar for boss / injured
       if (e.type === "boss" || e.hp < e.maxHp) {
@@ -2390,9 +2461,31 @@ function devicePixelRatioSafe() {
 // 직업 → 스프라이트 세트 이름. 아직 전용 이미지가 없는 직업은 매핑에서 빼면
 // 렌더러가 기존 사각형으로 폴백한다.
 const CLASS_SPRITE: Partial<Record<ClassId, string>> = {
+  wanderer: "wanderer",
+  berserker: "berserker",
   assassin: "assassin",
   guardian: "guardian",
-  // 마법사 계열 직업이 없으므로 sorcerer는 추후 매핑. (예: mage 직업 추가 시)
+  // sorcerer 스프라이트는 향후 최종 전직 구현 시 연결 예정.
+};
+
+// 일반 몬스터 타입 → 스프라이트 세트. 매핑 없으면 기존 도형으로 폴백.
+const ENEMY_SPRITE: Partial<Record<Enemy["type"], string>> = {
+  grunt: "grunt",
+  archer: "archer",
+  charger: "charger",
+  mage: "mage",
+  shielder: "shielder",
+  bomber: "bomber",
+  flyer: "flyer",
+  brute: "brute",
+};
+
+// 보스 종류 → 스프라이트 세트.
+const BOSS_SPRITE: Record<BossKind, string> = {
+  warden: "warden",
+  plaguelord: "plaguelord",
+  stormknight: "stormknight",
+  infernal: "infernal",
 };
 
 type SpriteSet = { frames: HTMLImageElement[]; loaded: boolean };
@@ -2419,7 +2512,12 @@ function loadSpriteSet(name: string): SpriteSet {
 
 // 미리 로드해두면 첫 등장 시 깜빡임이 없다.
 export function preloadSprites() {
-  for (const name of Object.values(CLASS_SPRITE)) {
+  const all = [
+    ...Object.values(CLASS_SPRITE),
+    ...Object.values(ENEMY_SPRITE),
+    ...Object.values(BOSS_SPRITE),
+  ];
+  for (const name of all) {
     if (name) loadSpriteSet(name);
   }
 }
